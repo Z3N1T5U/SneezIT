@@ -64,20 +64,27 @@ export function connectSocket() {
 }
 
 /**
- * Disconnect the socket from the signaling server.
- * Call this when the user leaves a room or navigates away.
+ * Disconnect and fully destroy the socket instance.
+ * Call this on session reset so the next connectSocket() creates a fresh socket.
+ * 
+ * WHY NEEDED?
+ * Socket.io keeps its own internal state. If we disconnect and then try to
+ * reconnect the same socket object, old event listeners may fire unexpectedly.
+ * Destroying and recreating gives us a clean slate.
  */
-export function disconnectSocket() {
-  if (socket && socket.connected) {
+export function resetSocket() {
+  if (socket) {
+    socket.off(); // Remove ALL event listeners
     socket.disconnect();
+    socket = null;
   }
 }
 
 /**
- * Check if the socket is currently connected.
+ * Disconnect without destroying (soft disconnect — kept for compatibility).
  */
-export function isConnected() {
-  return socket?.connected || false;
+export function disconnectSocket() {
+  resetSocket();
 }
 
-export default { getSocket, connectSocket, disconnectSocket, isConnected };
+export default { getSocket, connectSocket, resetSocket, disconnectSocket };
