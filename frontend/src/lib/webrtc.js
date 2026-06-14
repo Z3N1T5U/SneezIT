@@ -1,1026 +1,531 @@
+import { CHUNK_SIZE, computeHash } from './fileUtils';
+import { encryptChunk, decryptChunk } from './crypto';
+import { FileStorage } from './storage';
+
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+  ],
+};
+
 // ============================================================================
-// WebRTC Peer Connection Manager
+// SwarmManager (PeerConnection)
 // ============================================================================
+// Manages ALL peer connections in the room. Each connection is independent;
+// the swarm can download chunks from multiple peers simultaneously.
 //
-// This is the HEART of PeerDrop — the module that makes browsers talk directly.
-//
-// WHAT IS WebRTC?
-// WebRTC (Web Real-Time Communication) is a browser API that lets two browsers
-// exchange data directly, without routing through a server. Originally designed
-// for video calls, we use its "DataChannel" feature for file transfer.
-//
-// THE CONNECTION FLOW (simplified):
-//   1. Peer A creates an RTCPeerConnection and a DataChannel
-//   2. Peer A generates an "Offer" (SDP) describing its capabilities
-//   3. The Offer is sent to Peer B through our signaling server
-//   4. Peer B creates its own RTCPeerConnection and sets the Offer
-//   5. Peer B generates an "Answer" (SDP) and sends it back
-//   6. Both peers exchange ICE candidates (network routes)
-//   7. When a working route is found → direct P2P connection!
-//
-// ICE CANDIDATES:
-// ICE = Interactive Connectivity Establishment. Each peer discovers multiple
-// ways it could be reached (local IP, public IP from STUN, relay from TURN).
-// These are "candidates." Both peers try connecting via each candidate pair
-// until one works.
-//
-// STUN vs TURN:
-// - STUN: A lightweight server that tells you your public IP. Free and fast.
-//   Think of it as asking "what's my address?" at a post office.
-// - TURN: A relay server that forwards data when direct connection fails.
-//   Think of it as mailing a package through a forwarding service.
-//   We don't use TURN in this project (costs money to host), but our
-//   WebSocket relay fallback serves the same purpose for free.
-//
+// KEY DESIGN DECISIONS:
+// 1. Sender tracks how many chunks it has served (for UI progress)
+// 2. Receiver uses OPFS bitfield reconstruction for auto-resume
+// 3. onDataChannelOpen does NOT reset appState if already transferring
+// 4. onPeerLeft fires with remaining peer count for smart UI decisions
+// 5. Encryption is optional — if no key, chunks are sent plaintext
 // ============================================================================
-
-import { CHUNK_SIZE, computeHash, chunkFile, generateFileId } from './fileUtils';
-
-// ============================================================================
-// STUN Server Configuration
-// ============================================================================
-// These are free, public STUN servers provided by Google.
-// They help peers discover their public IP addresses.
-// We list multiple servers for redundancy — if one is down, others work.
-
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' },
-];
-
-// How long to wait for ICE candidates before giving up (milliseconds)
-const ICE_GATHERING_TIMEOUT = 10000;
-
-// How long to wait for P2P connection before falling back to relay
-const CONNECTION_TIMEOUT = 15000;
-
-// ============================================================================
-// PeerConnection Class
-// ============================================================================
-// Encapsulates all WebRTC logic into a clean, reusable class.
-
 export class PeerConnection {
-  constructor(socket, roomId, isSender, callbacks = {}) {
-    // Store references
-    this.socket = socket;           // Socket.io instance for signaling
-    this.roomId = roomId;           // The room we're in
-    this.isSender = isSender;       // Are we sending or receiving?
-    this.callbacks = callbacks;     // UI callback functions
-    
-    // WebRTC objects
-    this.pc = null;                 // RTCPeerConnection instance
-    this.dataChannel = null;        // RTCDataChannel for file transfer
-    this.chatChannel = null;        // RTCDataChannel for chat messages
-    
-    // Connection state
-    this.connected = false;
-    this.usingRelay = false;        // True if P2P failed and we're using server relay
-    this.connectionTimeout = null;
-    
-    // Transfer state (sender side)
-    this.filesToSend = [];          // Queue of files to send
-    this.currentFileIndex = 0;
-    this.sending = false;
-    
-    // Transfer state (receiver side)
-    this.receivedChunks = [];       // Received chunks for current file
-    this.receivedFilesMeta = [];    // Metadata for all files being received
-    this.currentReceivingFile = null;
-    this.totalBytesReceived = 0;
-    
-    // Stats tracking
-    this.transferStartTime = null;
-    this.lastSpeedUpdate = null;
-    this.lastBytesForSpeed = 0;
-    this.currentSpeed = 0;
-    
-    // Initialize
-    this._setupSocketListeners();
+  constructor(socket, roomId, isSender, callbacks) {
+    this.socket = socket;
+    this.roomId = roomId;
+    this.isSender = isSender;
+    this.callbacks = callbacks;
+    this.encryptionKey = callbacks.encryptionKey || null;
+
+    this.peers = new Map(); // peerId -> { pc, dc, relayMode, pendingCandidates }
+    this.activeTransfers = new Map();
+    this.isDestroyed = false;
+    this._pullTimer = null;
+    this._lastProgressEmit = 0; // Throttle progress UI updates
+
+    this._registerSocketHandlers();
+    this._startPullLoop();
   }
 
   // ==========================================================================
-  // Socket.IO Event Listeners (Signaling)
-  // ==========================================================================
-  // These handle the WebRTC handshake messages that come through the server.
-
-  _setupSocketListeners() {
-    // When we receive an Offer from the other peer
-    this.socket.on('offer', async ({ offer }) => {
-      this._log('Received SDP offer');
-      this.callbacks.onStatus?.('Received connection offer...');
-      await this._handleOffer(offer);
-    });
-
-    // When we receive an Answer to our Offer
-    this.socket.on('answer', async ({ answer }) => {
-      this._log('Received SDP answer');
-      this.callbacks.onStatus?.('Connection answer received...');
-      await this._handleAnswer(answer);
-    });
-
-    // When we receive an ICE candidate from the other peer
-    this.socket.on('ice-candidate', async ({ candidate }) => {
-      await this._handleIceCandidate(candidate);
-    });
-
-    // Relay fallback events (when P2P is blocked)
-    this.socket.on('relay-signal', ({ data }) => {
-      if (data.type === 'activate-relay') {
-        this._log('Peer requested relay mode');
-        this.usingRelay = true;
-        this.callbacks.onRelayActivated?.();
-      }
-    });
-
-    this.socket.on('relay-meta', ({ metadata }) => {
-      this._handleRelayMeta(metadata);
-    });
-
-    this.socket.on('relay-data', ({ chunk, index, totalChunks }) => {
-      this._handleRelayChunk(chunk, index, totalChunks);
-    });
-  }
-
-  // ==========================================================================
-  // Connection Initialization
+  // Socket event handlers (named so they can be removed cleanly in destroy)
   // ==========================================================================
 
-  /**
-   * Create the RTCPeerConnection and set up its event handlers.
-   * This is called before creating an offer or handling one.
-   */
-  _createPeerConnection() {
-    this._log('Creating RTCPeerConnection with STUN servers');
-    
-    // Create the connection with our ICE (STUN) server config
-    this.pc = new RTCPeerConnection({
-      iceServers: ICE_SERVERS,
-    });
-
-    // ---- Event: ICE Candidate Found ----
-    // As the browser discovers possible network routes, it fires this event.
-    // We send each candidate to the other peer through the signaling server.
-    this.pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        this.socket.emit('ice-candidate', {
-          candidate: event.candidate,
-          roomId: this.roomId,
-        });
-      }
+  _registerSocketHandlers() {
+    this._h_peerJoined = async ({ peerId }) => {
+      if (this.isDestroyed) return;
+      console.log(`[Swarm] peer-joined: ${peerId}`);
+      this.callbacks.onPeerCountChange?.(this.peers.size + 1);
+      await this._createPeer(peerId, true /* initiator */);
     };
-
-    // ---- Event: ICE Gathering State Changed ----
-    // Tracks the progress of ICE candidate discovery
-    this.pc.onicegatheringstatechange = () => {
-      this._log(`ICE gathering state: ${this.pc.iceGatheringState}`);
-      this.callbacks.onIceState?.({
-        gathering: this.pc.iceGatheringState,
-        connection: this.pc.iceConnectionState,
-      });
+    this._h_offer = async ({ offer, from }) => {
+      if (this.isDestroyed) return;
+      await this._createPeer(from, false);
+      const p = this.peers.get(from);
+      if (!p) return;
+      await p.pc.setRemoteDescription(new RTCSessionDescription(offer));
+      this._flushCandidates(from);
+      const answer = await p.pc.createAnswer();
+      await p.pc.setLocalDescription(answer);
+      this.socket.emit('answer', { answer, roomId: this.roomId, targetPeerId: from });
     };
-
-    // ---- Event: ICE Connection State Changed ----
-    // This tells us whether the P2P connection succeeded or failed
-    this.pc.oniceconnectionstatechange = () => {
-      const state = this.pc.iceConnectionState;
-      this._log(`ICE connection state: ${state}`);
-      
-      this.callbacks.onIceState?.({
-        gathering: this.pc.iceGatheringState,
-        connection: state,
-      });
-
-      switch (state) {
-        case 'connected':
-        case 'completed':
-          this._onP2PConnected();
-          break;
-        case 'failed':
-          this._log('P2P connection failed — activating relay fallback');
-          this._activateRelay();
-          break;
-        case 'disconnected':
-          this.callbacks.onStatus?.('Peer connection lost...');
-          break;
-        case 'closed':
-          this.callbacks.onStatus?.('Connection closed');
-          break;
-      }
+    this._h_answer = async ({ answer, from }) => {
+      if (this.isDestroyed) return;
+      const p = this.peers.get(from);
+      if (!p) return;
+      try { await p.pc.setRemoteDescription(new RTCSessionDescription(answer)); this._flushCandidates(from); }
+      catch (e) { console.warn('[Swarm] setRemoteDescription(answer) failed:', e); }
     };
-
-    // ---- Event: Connection State Changed ----
-    this.pc.onconnectionstatechange = () => {
-      this._log(`Connection state: ${this.pc.connectionState}`);
-      this.callbacks.onConnectionState?.(this.pc.connectionState);
-    };
-
-    // ---- Event: Data Channel Received (Receiver side) ----
-    // When the sender creates a data channel, the receiver gets it here
-    this.pc.ondatachannel = (event) => {
-      this._log(`Received data channel: ${event.channel.label}`);
-      
-      if (event.channel.label === 'fileTransfer') {
-        this.dataChannel = event.channel;
-        this._setupDataChannel(this.dataChannel);
-      } else if (event.channel.label === 'chat') {
-        this.chatChannel = event.channel;
-        this._setupChatChannel(this.chatChannel);
-      }
-    };
-  }
-
-  /**
-   * Called when P2P connection is successfully established.
-   */
-  _onP2PConnected() {
-    if (this.connected) return; // Avoid duplicate calls
-    
-    this.connected = true;
-    clearTimeout(this.connectionTimeout);
-    
-    this._log('✅ P2P connection established!');
-    this.callbacks.onConnected?.({ relay: false });
-    this.callbacks.onStatus?.('P2P connection established!');
-  }
-
-  // ==========================================================================
-  // Offer / Answer Flow (WebRTC Handshake)
-  // ==========================================================================
-
-  /**
-   * Initiate the WebRTC connection by creating an Offer.
-   * Called by the SENDER when the receiver joins the room.
-   */
-  async createOffer() {
-    this._createPeerConnection();
-    
-    // Create the data channels BEFORE creating the offer
-    // The offer needs to know about the channels we want to establish
-    this._createDataChannels();
-    
-    this.callbacks.onStatus?.('Creating connection offer...');
-    
-    try {
-      // Create the SDP offer
-      const offer = await this.pc.createOffer();
-      
-      // Set our local description (our side of the connection info)
-      await this.pc.setLocalDescription(offer);
-      
-      // Send the offer to the other peer through the signaling server
-      this.socket.emit('offer', {
-        offer: this.pc.localDescription,
-        roomId: this.roomId,
-      });
-      
-      this._log('SDP offer created and sent');
-      this.callbacks.onStatus?.('Offer sent, waiting for answer...');
-      
-      // Start a timeout — if P2P doesn't connect in time, use relay
-      this._startConnectionTimeout();
-      
-    } catch (error) {
-      this._log(`Error creating offer: ${error.message}`);
-      this.callbacks.onError?.(`Failed to create connection: ${error.message}`);
-    }
-  }
-
-  /**
-   * Handle an incoming Offer and create an Answer.
-   * Called by the RECEIVER when the sender's offer arrives.
-   */
-  async _handleOffer(offer) {
-    this._createPeerConnection();
-    
-    try {
-      // Set the remote description (the other peer's connection info)
-      await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
-      
-      // Create our answer
-      const answer = await this.pc.createAnswer();
-      await this.pc.setLocalDescription(answer);
-      
-      // Send the answer back through the signaling server
-      this.socket.emit('answer', {
-        answer: this.pc.localDescription,
-        roomId: this.roomId,
-      });
-      
-      this._log('SDP answer created and sent');
-      this.callbacks.onStatus?.('Answer sent, establishing connection...');
-      
-    } catch (error) {
-      this._log(`Error handling offer: ${error.message}`);
-      this.callbacks.onError?.(`Failed to handle connection: ${error.message}`);
-    }
-  }
-
-  /**
-   * Handle an incoming Answer to our Offer.
-   */
-  async _handleAnswer(answer) {
-    try {
-      await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
-      this._log('Remote description set from answer');
-    } catch (error) {
-      this._log(`Error handling answer: ${error.message}`);
-    }
-  }
-
-  /**
-   * Handle an incoming ICE candidate.
-   */
-  async _handleIceCandidate(candidate) {
-    try {
-      if (this.pc && candidate) {
-        await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
-      }
-    } catch (error) {
-      // ICE candidate errors are common and usually not fatal
-      // e.g., receiving a candidate before the remote description is set
-      this._log(`ICE candidate error (usually harmless): ${error.message}`);
-    }
-  }
-
-  // ==========================================================================
-  // Data Channels
-  // ==========================================================================
-  // DataChannels are like WebSockets, but they go directly between browsers
-  // instead of through a server. We create two channels:
-  //   1. fileTransfer — for sending file chunks (binary data)
-  //   2. chat — for sending text messages (JSON strings)
-
-  /**
-   * Create the data channels (sender side only).
-   * The receiver will get these channels via the ondatachannel event.
-   */
-  _createDataChannels() {
-    // File transfer channel — ordered and reliable (like TCP)
-    this.dataChannel = this.pc.createDataChannel('fileTransfer', {
-      ordered: true,  // Chunks arrive in order (important for file assembly!)
-    });
-    this._setupDataChannel(this.dataChannel);
-    
-    // Chat channel — ordered and reliable
-    this.chatChannel = this.pc.createDataChannel('chat', {
-      ordered: true,
-    });
-    this._setupChatChannel(this.chatChannel);
-    
-    this._log('Data channels created: fileTransfer, chat');
-  }
-
-  /**
-   * Set up event handlers for the file transfer data channel.
-   */
-  _setupDataChannel(channel) {
-    // Binary data should be received as ArrayBuffer (not Blob)
-    channel.binaryType = 'arraybuffer';
-    
-    channel.onopen = () => {
-      this._log('File transfer channel opened');
-      this.callbacks.onDataChannelOpen?.();
-    };
-
-    channel.onclose = () => {
-      this._log('File transfer channel closed');
-    };
-
-    channel.onerror = (error) => {
-      this._log(`Data channel error: ${error}`);
-    };
-
-    // Handle incoming messages (receiver side)
-    channel.onmessage = (event) => {
-      if (typeof event.data === 'string') {
-        // JSON control message (metadata, completion, etc.)
-        this._handleControlMessage(JSON.parse(event.data));
+    this._h_ice = ({ candidate, from }) => {
+      if (this.isDestroyed) return;
+      const p = this.peers.get(from);
+      if (!p) return;
+      if (p.pc.remoteDescription?.type) {
+        p.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
       } else {
-        // Binary data (file chunk)
-        this._handleChunk(event.data);
+        p.pendingCandidates.push(candidate);
       }
     };
+    this._h_peerLeft = ({ peerId }) => {
+      if (this.isDestroyed) return;
+      this._removePeer(peerId);
+      this.callbacks.onPeerLeft?.({ peerId, remainingPeers: this.peers.size });
+      this.callbacks.onPeerCountChange?.(this.peers.size);
+    };
+    this._h_relay = ({ data, from }) => {
+      if (this.isDestroyed) return;
+      this._handleMsg(from, data);
+    };
+
+    this.socket.on('peer-joined', this._h_peerJoined);
+    this.socket.on('offer', this._h_offer);
+    this.socket.on('answer', this._h_answer);
+    this.socket.on('ice-candidate', this._h_ice);
+    this.socket.on('peer-disconnected', this._h_peerLeft);
+    this.socket.on('relay-data', this._h_relay);
   }
 
-  /**
-   * Set up event handlers for the chat data channel.
-   */
-  _setupChatChannel(channel) {
-    channel.onopen = () => {
-      this._log('Chat channel opened');
-    };
-
-    channel.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        this.callbacks.onChatMessage?.({
-          message: msg.message,
-          from: 'peer',
-          timestamp: msg.timestamp,
-        });
-      } catch (e) {
-        this._log(`Invalid chat message: ${e.message}`);
-      }
-    };
+  _unregisterSocketHandlers() {
+    this.socket.off('peer-joined', this._h_peerJoined);
+    this.socket.off('offer', this._h_offer);
+    this.socket.off('answer', this._h_answer);
+    this.socket.off('ice-candidate', this._h_ice);
+    this.socket.off('peer-disconnected', this._h_peerLeft);
+    this.socket.off('relay-data', this._h_relay);
   }
 
   // ==========================================================================
-  // File Sending (Sender Side)
+  // WebRTC peer lifecycle
   // ==========================================================================
 
-  /**
-   * Queue files for sending.
-   * @param {FileList|File[]} files - The files to send
-   */
-  async sendFiles(files) {
-    this.filesToSend = Array.from(files);
-    this.currentFileIndex = 0;
-    
-    this._log(`Queued ${this.filesToSend.length} file(s) for sending`);
-    
-    // Send file list metadata first so receiver knows what's coming
-    const fileListMeta = this.filesToSend.map((file, index) => ({
-      id: generateFileId(),
-      name: file.name,
-      size: file.size,
-      type: file.type || 'application/octet-stream',
-      totalChunks: Math.ceil(file.size / CHUNK_SIZE),
-      index,
-    }));
-    
-    if (this.usingRelay) {
-      // Send via WebSocket relay
-      for (const meta of fileListMeta) {
-        this.socket.emit('relay-meta', { roomId: this.roomId, metadata: meta });
-        await this._sendFileViaRelay(this.filesToSend[meta.index], meta);
-      }
+  async _createPeer(peerId, isInitiator) {
+    if (this.peers.has(peerId)) return;
+    const pc = new RTCPeerConnection(ICE_SERVERS);
+    const peer = { pc, dc: null, relayMode: false, pendingCandidates: [] };
+    this.peers.set(peerId, peer);
+
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) this.socket.emit('ice-candidate', { candidate, roomId: this.roomId, targetPeerId: peerId });
+    };
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      this.callbacks.onIceState?.({ connection: s });
+      if (s === 'connected' || s === 'completed') this.callbacks.onConnected?.({ relay: false });
+      else if (s === 'failed') { peer.relayMode = true; this.callbacks.onRelayActivated?.(); }
+      else if (s === 'closed') this._removePeer(peerId);
+    };
+
+    if (isInitiator) {
+      const dc = pc.createDataChannel('peerdrop', { ordered: true });
+      this._setupDC(peerId, dc);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      this.socket.emit('offer', { offer, roomId: this.roomId, targetPeerId: peerId });
     } else {
-      // Send via P2P DataChannel
-      this._sendControlMessage({ type: 'file-list', files: fileListMeta });
-      this.callbacks.onTransferStart?.(fileListMeta);
-      await this._sendNextFile();
+      pc.ondatachannel = ({ channel }) => this._setupDC(peerId, channel);
     }
   }
 
-  /**
-   * Send the next file in the queue over the DataChannel.
-   * Files are sent one at a time, chunk by chunk.
-   */
-  async _sendNextFile() {
-    if (this.currentFileIndex >= this.filesToSend.length) {
-      // All files sent!
-      this._sendControlMessage({ type: 'all-complete' });
-      this.callbacks.onAllFilesComplete?.();
-      this._log('All files sent successfully!');
-      return;
-    }
-    
-    const file = this.filesToSend[this.currentFileIndex];
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    
-    this._log(`Sending file ${this.currentFileIndex + 1}/${this.filesToSend.length}: ${file.name} (${totalChunks} chunks)`);
-    
-    // Compute the full file hash before sending
-    // The receiver will compute the same hash after receiving all chunks
-    this.callbacks.onStatus?.(`Computing hash for ${file.name}...`);
-    const fileBuffer = await file.arrayBuffer();
-    const fileHash = await computeHash(fileBuffer);
-    
-    // Tell the receiver about this specific file
-    this._sendControlMessage({
-      type: 'file-start',
-      name: file.name,
-      size: file.size,
-      mimeType: file.type || 'application/octet-stream',
-      totalChunks,
-      hash: fileHash,
-      fileIndex: this.currentFileIndex,
-    });
-    
-    this.transferStartTime = Date.now();
-    this.lastSpeedUpdate = Date.now();
-    this.lastBytesForSpeed = 0;
-    
-    // Send chunks one by one
-    let bytesSent = 0;
-    
-    for await (const { chunk, index, totalChunks: total } of chunkFile(file)) {
-      // Wait if the DataChannel's buffer is full
-      // This prevents overwhelming the network and crashing the browser
-      await this._waitForBufferDrain();
-      
-      // Send the binary chunk
-      this.dataChannel.send(chunk);
-      bytesSent += chunk.byteLength;
-      
-      // Update progress
-      const progress = ((index + 1) / total) * 100;
-      this._updateSpeed(bytesSent);
-      
-      this.callbacks.onProgress?.({
-        fileIndex: this.currentFileIndex,
-        fileName: file.name,
-        chunkIndex: index,
-        totalChunks: total,
-        progress,
-        bytesSent,
-        totalBytes: file.size,
-        speed: this.currentSpeed,
-      });
-    }
-    
-    // Tell receiver this file is complete
-    this._sendControlMessage({
-      type: 'file-end',
-      fileIndex: this.currentFileIndex,
-      hash: fileHash,
-    });
-    
-    this._log(`File sent: ${file.name} (hash: ${fileHash.substring(0, 12)}...)`);
-    
-    // Move to next file
-    this.currentFileIndex++;
-    await this._sendNextFile();
+  _flushCandidates(peerId) {
+    const p = this.peers.get(peerId);
+    if (!p?.pendingCandidates.length) return;
+    p.pendingCandidates.forEach(c => p.pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {}));
+    p.pendingCandidates = [];
   }
 
-  /**
-   * Wait for the DataChannel's buffer to drain below a threshold.
-   * 
-   * WHY IS THIS NEEDED?
-   * The DataChannel has an internal buffer. If we send data faster than the
-   * network can transmit it, the buffer fills up. If we keep sending, the
-   * browser will either throw an error or drop data.
-   * 
-   * By waiting for the buffer to drain, we achieve flow control:
-   * - Send as fast as the network allows
-   * - Pause when the network is congested
-   * - Resume when the buffer has space
-   */
-  _waitForBufferDrain() {
-    // 256KB threshold — generous enough to keep the pipe full
-    const BUFFER_THRESHOLD = 256 * 1024;
-    
-    if (!this.dataChannel || this.dataChannel.bufferedAmount <= BUFFER_THRESHOLD) {
-      return Promise.resolve();
-    }
-    
-    return new Promise((resolve) => {
-      const checkBuffer = () => {
-        if (this.dataChannel.bufferedAmount <= BUFFER_THRESHOLD) {
-          resolve();
-        } else {
-          setTimeout(checkBuffer, 20); // Check every 20ms
-        }
-      };
-      checkBuffer();
-    });
+  _setupDC(peerId, dc) {
+    const peer = this.peers.get(peerId);
+    if (!peer) return;
+    peer.dc = dc;
+    dc.binaryType = 'arraybuffer';
+    dc.onopen = () => {
+      console.log(`[Swarm] DC open: ${peerId}`);
+      this.callbacks.onDataChannelOpen?.();
+      // Immediately sync state — send our file list (if sender) and bitfields
+      if (this.isSender && this.activeTransfers.size > 0) {
+        const files = [...this.activeTransfers.values()].map(t => ({
+          name: t.metadata.name, size: t.metadata.size,
+          type: t.metadata.type, fileIndex: t.metadata.fileIndex,
+        }));
+        this._sendTo(peerId, { type: 'file-list', files });
+      }
+      this._broadcastBitfields();
+    };
+    dc.onmessage = ({ data }) => this._handleMsg(peerId, data);
+    dc.onerror = e => console.warn(`[Swarm] DC error ${peerId}:`, e);
+  }
+
+  _removePeer(peerId) {
+    const p = this.peers.get(peerId);
+    if (!p) return;
+    try { p.dc?.close(); } catch (_) {}
+    try { p.pc?.close(); } catch (_) {}
+    this.peers.delete(peerId);
+    for (const t of this.activeTransfers.values()) t.peerBitfields.delete(peerId);
   }
 
   // ==========================================================================
-  // File Receiving (Receiver Side)
+  // Messaging — binary protocol
   // ==========================================================================
 
-  /**
-   * Handle a control message from the DataChannel.
-   * Control messages are JSON strings that coordinate the transfer.
-   */
-  _handleControlMessage(msg) {
+  _sendTo(peerId, msg) {
+    if (this.isDestroyed) return;
+    const peer = this.peers.get(peerId);
+    if (!peer) return;
+    try {
+      let buf;
+      if (msg.type === 'chunk-data') {
+        // [0x01][4B fileIdx][4B chunkIdx][payload]
+        const hdr = new DataView(new ArrayBuffer(9));
+        hdr.setUint8(0, 1);
+        hdr.setUint32(1, msg.fileIndex, true);
+        hdr.setUint32(5, msg.chunkIndex, true);
+        const out = new Uint8Array(9 + msg.data.byteLength);
+        out.set(new Uint8Array(hdr.buffer));
+        out.set(new Uint8Array(msg.data), 9);
+        buf = out.buffer;
+      } else {
+        // [0x00][JSON]
+        const json = new TextEncoder().encode(JSON.stringify(msg));
+        const out = new Uint8Array(1 + json.byteLength);
+        out[0] = 0;
+        out.set(json, 1);
+        buf = out.buffer;
+      }
+      if (!peer.relayMode && peer.dc?.readyState === 'open') peer.dc.send(buf);
+      else this.socket.emit('relay-data', { roomId: this.roomId, data: buf, targetPeerId: peerId });
+    } catch (e) { console.warn(`[Swarm] _sendTo ${peerId}:`, e); }
+  }
+
+  _broadcast(msg) {
+    for (const id of this.peers.keys()) this._sendTo(id, msg);
+  }
+
+  async _handleMsg(peerId, raw) {
+    let buf = raw instanceof Uint8Array ? raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) : raw;
+    if (!(buf instanceof ArrayBuffer)) return;
+    const v = new DataView(buf);
+    if (v.getUint8(0) === 0) {
+      try { await this._handleCtrl(peerId, JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 1)))); }
+      catch (e) { console.error('[Swarm] JSON parse error:', e); }
+    } else {
+      await this._handleChunkData(peerId, v.getUint32(1, true), v.getUint32(5, true), buf.slice(9));
+    }
+  }
+
+  // ==========================================================================
+  // Control message dispatch
+  // ==========================================================================
+
+  async _handleCtrl(peerId, msg) {
     switch (msg.type) {
-      case 'file-list':
-        // Sender told us what files are coming
-        this.receivedFilesMeta = msg.files;
-        this.callbacks.onFileList?.(msg.files);
-        this._log(`Expecting ${msg.files.length} file(s)`);
-        break;
-        
-      case 'file-start':
-        // A new file is starting
-        this.currentReceivingFile = msg;
-        this.receivedChunks = [];
-        this.totalBytesReceived = 0;
-        this.transferStartTime = Date.now();
-        this.lastSpeedUpdate = Date.now();
-        this.lastBytesForSpeed = 0;
-        
-        this.callbacks.onFileStart?.(msg);
-        this._log(`Receiving file: ${msg.name} (${msg.totalChunks} chunks, hash: ${msg.hash?.substring(0, 12)}...)`);
-        break;
-        
-      case 'file-end':
-        // File transfer complete — verify and trigger download
-        this._assembleAndVerifyFile(msg);
-        break;
-        
-      case 'all-complete':
-        this.callbacks.onAllFilesComplete?.();
-        this._log('All files received!');
-        break;
+      case 'file-list':   this._handleFileList(msg.files); break;
+      case 'bitfield':    this._handleBitfield(peerId, msg.fileIndex, msg.bitfield); break;
+      case 'have-chunk':  this._handleHaveChunk(peerId, msg.fileIndex, msg.chunkIndex); break;
+      case 'request-chunk': await this._handleChunkRequest(peerId, msg.fileIndex, msg.chunkIndex); break;
+      case 'chat':        this.callbacks.onChatMessage?.({ message: msg.text, from: 'peer', timestamp: Date.now() }); break;
     }
-  }
-
-  /**
-   * Handle an incoming file chunk (binary ArrayBuffer).
-   */
-  _handleChunk(data) {
-    this.receivedChunks.push(data);
-    this.totalBytesReceived += data.byteLength;
-    
-    const totalChunks = this.currentReceivingFile?.totalChunks || 0;
-    const progress = (this.receivedChunks.length / totalChunks) * 100;
-    
-    this._updateSpeed(this.totalBytesReceived);
-    
-    this.callbacks.onProgress?.({
-      fileIndex: this.currentReceivingFile?.fileIndex || 0,
-      fileName: this.currentReceivingFile?.name || 'Unknown',
-      chunkIndex: this.receivedChunks.length - 1,
-      totalChunks,
-      progress,
-      bytesSent: this.totalBytesReceived,
-      totalBytes: this.currentReceivingFile?.size || 0,
-      speed: this.currentSpeed,
-    });
-  }
-
-  /**
-   * Assemble all received chunks into a complete file and verify its hash.
-   * 
-   * HOW IT WORKS:
-   * 1. Concatenate all ArrayBuffer chunks into one big ArrayBuffer
-   * 2. Compute SHA-256 hash of the assembled file
-   * 3. Compare with the sender's hash — if they match, file is intact!
-   * 4. Create a Blob and trigger a browser download
-   */
-  async _assembleAndVerifyFile(endMsg) {
-    this.callbacks.onStatus?.('Assembling file and verifying integrity...');
-    
-    // Step 1: Concatenate all chunks
-    const totalSize = this.receivedChunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-    const assembled = new Uint8Array(totalSize);
-    let offset = 0;
-    
-    for (const chunk of this.receivedChunks) {
-      assembled.set(new Uint8Array(chunk), offset);
-      offset += chunk.byteLength;
-    }
-    
-    // Step 2: Compute hash of the assembled file
-    const receivedHash = await computeHash(assembled.buffer);
-    const expectedHash = endMsg.hash || this.currentReceivingFile?.hash;
-    const hashMatch = receivedHash === expectedHash;
-    
-    this._log(`Hash verification: ${hashMatch ? '✅ MATCH' : '❌ MISMATCH'}`);
-    this._log(`  Expected: ${expectedHash?.substring(0, 20)}...`);
-    this._log(`  Got:      ${receivedHash.substring(0, 20)}...`);
-    
-    this.callbacks.onHashVerification?.({
-      fileIndex: this.currentReceivingFile?.fileIndex || 0,
-      fileName: this.currentReceivingFile?.name,
-      match: hashMatch,
-      expectedHash,
-      receivedHash,
-    });
-    
-    // Step 3: Create a downloadable blob
-    const blob = new Blob([assembled], {
-      type: this.currentReceivingFile?.mimeType || 'application/octet-stream',
-    });
-    
-    // Step 4: Trigger browser download
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = this.currentReceivingFile?.name || 'download';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    
-    // Clean up the object URL to free memory
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-    
-    this.callbacks.onFileComplete?.({
-      fileIndex: this.currentReceivingFile?.fileIndex || 0,
-      name: this.currentReceivingFile?.name,
-      size: totalSize,
-      hash: receivedHash,
-      verified: hashMatch,
-    });
-    
-    // Clear chunks to free memory
-    this.receivedChunks = [];
   }
 
   // ==========================================================================
-  // WebSocket Relay Fallback
-  // ==========================================================================
-  // When P2P doesn't work (strict firewalls, symmetric NATs), we fall back
-  // to relaying file data through the signaling server.
-  //
-  // WHY THIS MATTERS:
-  // Your group chat discussed this! On public WiFi and corporate networks,
-  // P2P is often blocked. Without a relay fallback, the app simply wouldn't
-  // work on those networks. With relay, it works everywhere — just slower
-  // because data routes through the server.
-
-  /**
-   * Start connection timeout timer.
-   * If P2P doesn't connect within CONNECTION_TIMEOUT, activate relay.
-   */
-  _startConnectionTimeout() {
-    this.connectionTimeout = setTimeout(() => {
-      if (!this.connected) {
-        this._log(`P2P connection timeout after ${CONNECTION_TIMEOUT}ms`);
-        this._activateRelay();
-      }
-    }, CONNECTION_TIMEOUT);
-  }
-
-  /**
-   * Activate WebSocket relay mode.
-   * Notify the other peer and switch to server-relayed transfer.
-   */
-  _activateRelay() {
-    if (this.usingRelay) return; // Already in relay mode
-    
-    this.usingRelay = true;
-    this.connected = true; // We're "connected" via relay
-    clearTimeout(this.connectionTimeout);
-    
-    // Tell the other peer we're switching to relay mode
-    this.socket.emit('relay-signal', {
-      roomId: this.roomId,
-      data: { type: 'activate-relay' },
-    });
-    
-    this._log('Switched to WebSocket relay mode (P2P blocked)');
-    this.callbacks.onConnected?.({ relay: true });
-    this.callbacks.onRelayActivated?.();
-    this.callbacks.onStatus?.('P2P blocked — using server relay');
-  }
-
-  /**
-   * Send a file through the WebSocket relay.
-   */
-  async _sendFileViaRelay(file, meta) {
-    this._log(`Sending file via relay: ${file.name}`);
-    this.transferStartTime = Date.now();
-    this.lastSpeedUpdate = Date.now();
-    this.lastBytesForSpeed = 0;
-    
-    const totalChunks = meta.totalChunks;
-    let bytesSent = 0;
-    let chunkIndex = 0;
-    
-    for await (const { chunk } of chunkFile(file)) {
-      // Convert ArrayBuffer to base64 for WebSocket transport
-      const base64 = arrayBufferToBase64(chunk);
-      
-      this.socket.emit('relay-data', {
-        roomId: this.roomId,
-        chunk: base64,
-        index: chunkIndex,
-        totalChunks,
-      });
-      
-      bytesSent += chunk.byteLength;
-      chunkIndex++;
-      
-      const progress = (chunkIndex / totalChunks) * 100;
-      this._updateSpeed(bytesSent);
-      
-      this.callbacks.onProgress?.({
-        fileIndex: meta.index,
-        fileName: file.name,
-        chunkIndex: chunkIndex - 1,
-        totalChunks,
-        progress,
-        bytesSent,
-        totalBytes: file.size,
-        speed: this.currentSpeed,
-      });
-      
-      // Small delay to avoid overwhelming the server
-      await new Promise(r => setTimeout(r, 5));
-    }
-    
-    this._log(`File sent via relay: ${file.name}`);
-  }
-
-  /**
-   * Handle file metadata received via relay.
-   */
-  _handleRelayMeta(metadata) {
-    this.currentReceivingFile = metadata;
-    this.receivedChunks = [];
-    this.totalBytesReceived = 0;
-    this.transferStartTime = Date.now();
-    
-    this.callbacks.onFileStart?.(metadata);
-    this.callbacks.onTransferStart?.([metadata]);
-    this._log(`Receiving file via relay: ${metadata.name}`);
-  }
-
-  /**
-   * Handle a file chunk received via relay.
-   */
-  _handleRelayChunk(base64Chunk, index, totalChunks) {
-    // Convert base64 back to ArrayBuffer
-    const chunk = base64ToArrayBuffer(base64Chunk);
-    this.receivedChunks.push(chunk);
-    this.totalBytesReceived += chunk.byteLength;
-    
-    const progress = ((index + 1) / totalChunks) * 100;
-    this._updateSpeed(this.totalBytesReceived);
-    
-    this.callbacks.onProgress?.({
-      fileIndex: this.currentReceivingFile?.index || 0,
-      fileName: this.currentReceivingFile?.name || 'Unknown',
-      chunkIndex: index,
-      totalChunks,
-      progress,
-      bytesSent: this.totalBytesReceived,
-      totalBytes: this.currentReceivingFile?.size || 0,
-      speed: this.currentSpeed,
-    });
-    
-    // If we've received all chunks, assemble the file
-    if (index + 1 >= totalChunks) {
-      this._assembleRelayFile();
-    }
-  }
-
-  /**
-   * Assemble a file received via relay and trigger download.
-   */
-  async _assembleRelayFile() {
-    this.callbacks.onStatus?.('Assembling relayed file...');
-    
-    const totalSize = this.receivedChunks.reduce((sum, c) => sum + c.byteLength, 0);
-    const assembled = new Uint8Array(totalSize);
-    let offset = 0;
-    
-    for (const chunk of this.receivedChunks) {
-      assembled.set(new Uint8Array(chunk), offset);
-      offset += chunk.byteLength;
-    }
-    
-    // Compute hash
-    const hash = await computeHash(assembled.buffer);
-    
-    // Trigger download
-    const blob = new Blob([assembled], {
-      type: this.currentReceivingFile?.type || 'application/octet-stream',
-    });
-    
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = this.currentReceivingFile?.name || 'download';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-    
-    this.callbacks.onFileComplete?.({
-      fileIndex: this.currentReceivingFile?.index || 0,
-      name: this.currentReceivingFile?.name,
-      size: totalSize,
-      hash,
-      verified: true, // Relay doesn't have sender hash to compare, mark as OK
-    });
-    
-    this.callbacks.onAllFilesComplete?.();
-    this.receivedChunks = [];
-    this._log(`Relay file assembled and downloaded: ${this.currentReceivingFile?.name}`);
-  }
-
-  // ==========================================================================
-  // Chat
+  // File list (sent by sender on DC open, and when first starting)
   // ==========================================================================
 
-  /**
-   * Send a chat message to the peer.
-   * Uses DataChannel if connected P2P, otherwise falls back to Socket.io.
-   */
-  sendChatMessage(message) {
-    const msg = {
-      message,
-      timestamp: Date.now(),
-    };
-    
-    if (this.chatChannel && this.chatChannel.readyState === 'open') {
-      // Send directly over P2P
-      this.chatChannel.send(JSON.stringify(msg));
-    } else {
-      // Fall back to server relay
-      this.socket.emit('chat-message', {
-        message,
-        roomId: this.roomId,
+  async sendFiles(files) {
+    this.isSender = true;
+    const fileList = files.map((f, i) => ({ name: f.name, size: f.size, type: f.type, fileIndex: i }));
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      this.activeTransfers.set(i, {
+        file,
+        metadata: { name: file.name, size: file.size, type: file.type, totalChunks, fileIndex: i },
+        myBitfield: new Uint8Array(totalChunks).fill(1),
+        peerBitfields: new Map(),
+        pendingRequests: new Set(),
+        receivedCount: totalChunks,
+        chunksServed: 0,
+        speedTrack: { time: Date.now(), chunksServed: 0 },
       });
     }
-    
-    return msg;
+    this._broadcast({ type: 'file-list', files: fileList });
+    this._broadcastBitfields();
+    this.callbacks.onTransferStart?.(fileList);
   }
 
-  // ==========================================================================
-  // Utilities
-  // ==========================================================================
+  _handleFileList(files) {
+    const newFiles = [];
+    for (const meta of files) {
+      if (this.activeTransfers.has(meta.fileIndex)) continue;
+      const totalChunks = Math.ceil(meta.size / CHUNK_SIZE);
+      const storage = new FileStorage(meta.name, meta.size);
 
-  /**
-   * Send a JSON control message over the file transfer DataChannel.
-   */
-  _sendControlMessage(msg) {
-    if (this.dataChannel && this.dataChannel.readyState === 'open') {
-      this.dataChannel.send(JSON.stringify(msg));
+      // Async init — returns reconstructed bitfield for auto-resume
+      storage.init(totalChunks, CHUNK_SIZE).then(existingBitfield => {
+        const haveCount = existingBitfield.reduce((s, b) => s + b, 0);
+        const t = this.activeTransfers.get(meta.fileIndex);
+        if (!t) return;
+        t.myBitfield = existingBitfield;
+        t.receivedCount = haveCount;
+        this._broadcast({ type: 'bitfield', fileIndex: meta.fileIndex, bitfield: Array.from(existingBitfield) });
+        if (haveCount > 0) {
+          console.log(`[Swarm] Auto-resume: already have ${haveCount}/${totalChunks} chunks for "${meta.name}"`);
+          this.callbacks.onResumed?.({ fileIndex: meta.fileIndex, chunksHave: haveCount, totalChunks });
+        }
+        // If already complete from OPFS (entire file was already downloaded before)
+        if (haveCount >= totalChunks) {
+          console.log(`[Swarm] File "${meta.name}" already complete in OPFS, finalizing...`);
+          this._finalize(meta.fileIndex);
+        }
+      });
+
+      this.activeTransfers.set(meta.fileIndex, {
+        storage,
+        metadata: { ...meta, totalChunks },
+        myBitfield: new Uint8Array(totalChunks).fill(0), // Will be updated after init resolves
+        peerBitfields: new Map(),
+        pendingRequests: new Set(),
+        receivedCount: 0,
+        speedTrack: { time: Date.now(), bytes: 0 },
+      });
+      newFiles.push(meta);
+    }
+    if (newFiles.length > 0) {
+      this.callbacks.onFileList?.(newFiles);
+      this._broadcastBitfields();
     }
   }
 
-  /**
-   * Update transfer speed calculation.
-   * Uses a simple rolling calculation over 1-second windows.
-   */
-  _updateSpeed(currentBytes) {
+  _broadcastBitfields() {
+    for (const [fIdx, t] of this.activeTransfers) {
+      this._broadcast({ type: 'bitfield', fileIndex: fIdx, bitfield: Array.from(t.myBitfield) });
+    }
+  }
+
+  _handleBitfield(peerId, fileIndex, arr) {
+    const t = this.activeTransfers.get(fileIndex);
+    if (!t) return;
+    t.peerBitfields.set(peerId, new Uint8Array(arr));
+  }
+
+  _handleHaveChunk(peerId, fileIndex, chunkIndex) {
+    const t = this.activeTransfers.get(fileIndex);
+    if (!t) return;
+    if (!t.peerBitfields.has(peerId)) t.peerBitfields.set(peerId, new Uint8Array(t.metadata.totalChunks));
+    t.peerBitfields.get(peerId)[chunkIndex] = 1;
+  }
+
+  // ==========================================================================
+  // Pull loop — drives chunk requests from receiver side
+  // ==========================================================================
+
+  _startPullLoop() {
+    this._pullTimer = setInterval(() => {
+      if (!this.isDestroyed) this._tick();
+    }, 40);
+  }
+
+  _tick() {
     const now = Date.now();
-    const elapsed = (now - this.lastSpeedUpdate) / 1000; // seconds
-    
-    if (elapsed >= 0.5) { // Update every 500ms
-      const byteDelta = currentBytes - this.lastBytesForSpeed;
-      this.currentSpeed = byteDelta / elapsed;
-      this.lastSpeedUpdate = now;
-      this.lastBytesForSpeed = currentBytes;
+    // Throttle UI updates to max every 200ms to prevent flickering
+    const shouldEmitProgress = (now - this._lastProgressEmit) >= 200;
+
+    for (const [fIdx, t] of this.activeTransfers) {
+      const isDone = t.receivedCount >= t.metadata.totalChunks;
+
+      // ---- SENDER progress ----
+      if (t.file) {
+        if (!shouldEmitProgress) continue;
+        const totalPeers = this.peers.size;
+        if (totalPeers === 0) continue;
+        let totalReceivedByPeers = 0;
+        let peerCount = 0;
+        for (const [, bf] of t.peerBitfields) {
+          totalReceivedByPeers += bf.reduce((s, b) => s + b, 0);
+          peerCount++;
+        }
+        if (peerCount === 0) continue;
+        const avgChunksAtPeers = totalReceivedByPeers / peerCount;
+        const pct = (avgChunksAtPeers / t.metadata.totalChunks) * 100;
+        const elapsed = (now - t.speedTrack.time) / 1000;
+        let speed = 0;
+        if (elapsed >= 1.0) {
+          speed = ((t.chunksServed - t.speedTrack.chunksServed) * CHUNK_SIZE) / elapsed;
+          t.speedTrack = { time: now, chunksServed: t.chunksServed };
+        }
+        this.callbacks.onProgress?.({
+          fileName: t.metadata.name, fileIndex: fIdx,
+          progress: Math.min(pct, 100),
+          bytesSent: Math.min(Math.round(avgChunksAtPeers) * CHUNK_SIZE, t.metadata.size),
+          totalBytes: t.metadata.size,
+          speed, isSender: true,
+          chunkIndex: Math.round(avgChunksAtPeers),
+          totalChunks: t.metadata.totalChunks,
+          activePeers: peerCount,
+        });
+        continue;
+      }
+
+      // ---- RECEIVER: already done ----
+      if (isDone) continue;
+
+      // ---- RECEIVER: emit progress (throttled) ----
+      if (shouldEmitProgress) {
+        const elapsed = (now - t.speedTrack.time) / 1000;
+        const bytesNow = Math.min(t.receivedCount * CHUNK_SIZE, t.metadata.size);
+        let speed = 0;
+        if (elapsed >= 0.5) {
+          speed = (bytesNow - t.speedTrack.bytes) / elapsed;
+          t.speedTrack = { time: now, bytes: bytesNow };
+        }
+        this.callbacks.onProgress?.({
+          fileName: t.metadata.name, fileIndex: fIdx,
+          progress: (t.receivedCount / t.metadata.totalChunks) * 100,
+          bytesSent: bytesNow, totalBytes: t.metadata.size,
+          speed, isSender: false,
+          chunkIndex: t.receivedCount, totalChunks: t.metadata.totalChunks,
+          activePeers: this.peers.size,
+        });
+      }
+
+      // ---- RECEIVER: request missing chunks (always runs, not throttled) ----
+      const MAX_INFLIGHT = 16;
+      if (t.pendingRequests.size >= MAX_INFLIGHT) continue;
+      for (let i = 0; i < t.metadata.totalChunks; i++) {
+        if (t.pendingRequests.size >= MAX_INFLIGHT) break;
+        if (t.myBitfield[i] === 1 || t.pendingRequests.has(i)) continue;
+        const candidates = [...t.peerBitfields.entries()]
+          .filter(([pid, bf]) => bf[i] === 1 && this.peers.has(pid))
+          .map(([pid]) => pid);
+        if (!candidates.length) continue;
+        const target = candidates[Math.floor(Math.random() * candidates.length)];
+        t.pendingRequests.add(i);
+        setTimeout(() => t.pendingRequests.delete(i), 5000);
+        this._sendTo(target, { type: 'request-chunk', fileIndex: fIdx, chunkIndex: i });
+      }
+    }
+
+    if (shouldEmitProgress) this._lastProgressEmit = now;
+  }
+
+  // ==========================================================================
+  // Chunk serving
+  // ==========================================================================
+
+  async _handleChunkRequest(peerId, fileIndex, chunkIndex) {
+    const t = this.activeTransfers.get(fileIndex);
+    if (!t || t.myBitfield[chunkIndex] !== 1) return;
+    try {
+      let plain;
+      if (t.file) {
+        const start = chunkIndex * CHUNK_SIZE;
+        plain = await t.file.slice(start, Math.min(start + CHUNK_SIZE, t.metadata.size)).arrayBuffer();
+      } else {
+        const start = chunkIndex * CHUNK_SIZE;
+        const size = Math.min(CHUNK_SIZE, t.metadata.size - start);
+        plain = await t.storage.readChunk(start, size);
+      }
+      if (!plain || plain.byteLength === 0) return;
+
+      const payload = this.encryptionKey ? await encryptChunk(this.encryptionKey, plain) : plain;
+      this._sendTo(peerId, { type: 'chunk-data', fileIndex, chunkIndex, data: payload });
+
+      // Track chunks served (sender progress)
+      if (t.file) t.chunksServed = (t.chunksServed || 0) + 1;
+    } catch (e) {
+      console.error(`[Swarm] Chunk ${chunkIndex} serve error:`, e);
     }
   }
 
-  /**
-   * Logging helper with a [WebRTC] prefix for easy filtering.
-   */
-  _log(message) {
-    console.log(`[WebRTC] ${message}`);
+  // ==========================================================================
+  // Chunk receiving
+  // ==========================================================================
+
+  async _handleChunkData(peerId, fileIndex, chunkIndex, payload) {
+    const t = this.activeTransfers.get(fileIndex);
+    if (!t || t.myBitfield[chunkIndex] === 1) return; // Duplicate
+    try {
+      const data = this.encryptionKey ? await decryptChunk(this.encryptionKey, payload) : payload;
+      await t.storage.writeChunk(chunkIndex * CHUNK_SIZE, data);
+      t.myBitfield[chunkIndex] = 1;
+      t.receivedCount++;
+      t.pendingRequests.delete(chunkIndex);
+      // Let all peers know we have this (enables mesh seeding)
+      this._broadcast({ type: 'have-chunk', fileIndex, chunkIndex });
+      if (t.receivedCount >= t.metadata.totalChunks) await this._finalize(fileIndex);
+    } catch (e) {
+      console.error(`[Swarm] Chunk ${chunkIndex} error:`, e);
+      t.pendingRequests.delete(chunkIndex); // Allow retry
+    }
   }
 
-  /**
-   * Clean up all connections and resources.
-   * Call this when leaving the room or unmounting the component.
-   */
+  async _finalize(fileIndex) {
+    const t = this.activeTransfers.get(fileIndex);
+    if (!t?.storage) return;
+    this.callbacks.onProgress?.({
+      fileName: t.metadata.name, fileIndex,
+      progress: 100, bytesSent: t.metadata.size, totalBytes: t.metadata.size,
+      speed: 0, isSender: false,
+      chunkIndex: t.metadata.totalChunks, totalChunks: t.metadata.totalChunks,
+      activePeers: this.peers.size,
+    });
+    try {
+      const blob = await t.storage.finish();
+      const url = URL.createObjectURL(blob);
+      const isLarge = t.metadata.size > 200 * 1024 * 1024;
+      let checksum = this.encryptionKey ? 'AES-GCM Authenticated' : 'Unencrypted Transfer';
+      if (!isLarge) {
+        try { checksum = await computeHash(await blob.arrayBuffer()); } catch (_) {}
+      }
+      this.callbacks.onFileComplete?.({
+        fileIndex, name: t.metadata.name, size: t.metadata.size,
+        type: t.metadata.type, url, verified: true, checksum,
+      });
+      const allDone = [...this.activeTransfers.values()].every(
+        tr => tr.file /* sender */ || tr.receivedCount >= tr.metadata.totalChunks
+      );
+      if (allDone) this.callbacks.onAllFilesComplete?.();
+    } catch (err) {
+      this.callbacks.onError?.(`Save failed: ${err.message}`);
+    }
+  }
+
+  // ==========================================================================
+  // Public API
+  // ==========================================================================
+
+  getPeerCount() { return this.peers.size; }
+
+  sendChatMessage(text) {
+    this._broadcast({ type: 'chat', text });
+    return { message: text, timestamp: Date.now() };
+  }
+
+  createOffer() {} // Legacy stub
+
   destroy() {
-    clearTimeout(this.connectionTimeout);
-    
-    if (this.dataChannel) {
-      this.dataChannel.close();
-      this.dataChannel = null;
+    if (this.isDestroyed) return;
+    this.isDestroyed = true;
+    if (this._pullTimer) clearInterval(this._pullTimer);
+    this._unregisterSocketHandlers();
+    for (const p of this.peers.values()) {
+      try { p.dc?.close(); } catch (_) {}
+      try { p.pc?.close(); } catch (_) {}
     }
-    
-    if (this.chatChannel) {
-      this.chatChannel.close();
-      this.chatChannel = null;
-    }
-    
-    if (this.pc) {
-      this.pc.close();
-      this.pc = null;
-    }
-    
-    // Remove socket listeners
-    this.socket.off('offer');
-    this.socket.off('answer');
-    this.socket.off('ice-candidate');
-    this.socket.off('relay-signal');
-    this.socket.off('relay-meta');
-    this.socket.off('relay-data');
-    
-    this.connected = false;
-    this._log('PeerConnection destroyed');
+    this.peers.clear();
   }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/**
- * Convert an ArrayBuffer to a base64 string.
- * Needed for WebSocket relay (sockets handle strings better than binary).
- */
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-/**
- * Convert a base64 string back to an ArrayBuffer.
- */
-function base64ToArrayBuffer(base64) {
-  const binaryString = atob(base64);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes.buffer;
 }
