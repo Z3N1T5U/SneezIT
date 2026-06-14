@@ -319,25 +319,34 @@ export default function App() {
       setStatusMessage('Joined room! Waiting for sender...');
     });
 
-    // ---- SENDER: The other peer joined the room ----
+    // ---- SENDER: A peer joined the room ----
+    // Only change state if we're in a waiting/idle phase.
+    // If we're already transferring (a peer reconnected mid-transfer),
+    // keep the current state — the swarm will handle re-syncing.
     socket.on('peer-joined', ({ peerId }) => {
       console.log('[Socket] Peer joined:', peerId);
-      setAppState('connecting');
-      setStatusMessage('Peer joined! Mesh network active.');
+      const state = appStateRef.current;
+      if (state === 'waiting' || state === 'idle') {
+        setAppState('connecting');
+        setStatusMessage('Peer joined! Establishing connection...');
+      } else if (state === 'transferring') {
+        setStatusMessage('A new peer joined — syncing transfer state...');
+      }
     });
 
     // ---- Both peers: the other peer left ----
     socket.on('peer-disconnected', ({ peerId }) => {
       console.log('[Socket] Peer disconnected:', peerId);
-      // Swarm manager handles peer removal internally via its own socket handler.
-      // Here we just update the app state as a safety net.
       if (!allCompleteRef.current) {
         const state = appStateRef.current;
-        if (state !== 'transferring' && state !== 'complete') {
+        if (state === 'transferring') {
+          // Stay in transferring — the swarm's onPeerLeft callback handles
+          // showing the toast. Transfer can continue or wait for reconnect.
+          setErrorMessage('Your peer has left. Transfer paused — they can rejoin to resume.');
+        } else if (state !== 'complete') {
           setErrorMessage('Your peer has left the room.');
           setAppState('waiting');
         }
-        // If transferring, let the swarm handle it (it will show a toast)
       }
     });
 
@@ -967,21 +976,24 @@ export default function App() {
                     <div className="grid grid-cols-4 gap-2">
                       <div className="bg-white/[0.04] rounded-xl p-3 text-center">
                         <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Speed</p>
-                        <p className="text-sm font-bold text-white">
-                          {progress.speed > 0 ? formatSpeed(progress.speed) : '—'}
+                        <p className="text-sm font-bold text-white font-mono">
+                          {/* Show speed if available; '—' only at start before first measurement */}
+                          {progress.speed > 0
+                            ? formatSpeed(progress.speed)
+                            : progress.bytesSent > 0 ? 'Measuring...' : '—'}
                         </p>
                       </div>
                       <div className="bg-white/[0.04] rounded-xl p-3 text-center">
                         <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Transferred</p>
-                        <p className="text-sm font-bold text-white">
+                        <p className="text-sm font-bold text-white font-mono">
                           {formatFileSize(progress.bytesSent)}
                         </p>
                         <p className="text-[10px] text-gray-600">of {formatFileSize(progress.totalBytes)}</p>
                       </div>
                       <div className="bg-white/[0.04] rounded-xl p-3 text-center">
                         <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Chunks</p>
-                        <p className="text-sm font-bold text-white">
-                          {progress.chunkIndex}/{progress.totalChunks}
+                        <p className="text-sm font-bold text-white font-mono">
+                          {progress.chunkIndex}<span className="text-gray-500 text-xs">/{progress.totalChunks}</span>
                         </p>
                       </div>
                       <div className="bg-purple-500/[0.08] border border-purple-500/10 rounded-xl p-3 text-center">

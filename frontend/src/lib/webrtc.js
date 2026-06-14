@@ -341,8 +341,8 @@ export class PeerConnection {
 
   _tick() {
     const now = Date.now();
-    // Throttle UI updates to max every 200ms to prevent flickering
-    const shouldEmitProgress = (now - this._lastProgressEmit) >= 200;
+    // Throttle UI updates to max every 250ms to prevent flickering
+    const shouldEmitProgress = (now - this._lastProgressEmit) >= 250;
 
     for (const [fIdx, t] of this.activeTransfers) {
       const isDone = t.receivedCount >= t.metadata.totalChunks;
@@ -361,18 +361,26 @@ export class PeerConnection {
         if (peerCount === 0) continue;
         const avgChunksAtPeers = totalReceivedByPeers / peerCount;
         const pct = (avgChunksAtPeers / t.metadata.totalChunks) * 100;
-        const elapsed = (now - t.speedTrack.time) / 1000;
-        let speed = 0;
-        if (elapsed >= 1.0) {
-          speed = ((t.chunksServed - t.speedTrack.chunksServed) * CHUNK_SIZE) / elapsed;
+        const bytesSent = Math.min(Math.round(avgChunksAtPeers) * CHUNK_SIZE, t.metadata.size);
+
+        // Speed: bytes uploaded per second, using smoothed EMA
+        const sElapsed = (now - t.speedTrack.time) / 1000;
+        if (sElapsed >= 1.0) {
+          const rawSpeed = (t.chunksServed - t.speedTrack.chunksServed) * CHUNK_SIZE / sElapsed;
+          // Exponential moving average — blends new reading with history
+          t._smoothedSpeed = t._smoothedSpeed !== undefined
+            ? t._smoothedSpeed * 0.6 + rawSpeed * 0.4
+            : rawSpeed;
           t.speedTrack = { time: now, chunksServed: t.chunksServed };
         }
+
         this.callbacks.onProgress?.({
           fileName: t.metadata.name, fileIndex: fIdx,
           progress: Math.min(pct, 100),
-          bytesSent: Math.min(Math.round(avgChunksAtPeers) * CHUNK_SIZE, t.metadata.size),
+          bytesSent,
           totalBytes: t.metadata.size,
-          speed, isSender: true,
+          speed: t._smoothedSpeed ?? 0, // Never undefined/flicker
+          isSender: true,
           chunkIndex: Math.round(avgChunksAtPeers),
           totalChunks: t.metadata.totalChunks,
           activePeers: peerCount,
@@ -385,19 +393,28 @@ export class PeerConnection {
 
       // ---- RECEIVER: emit progress (throttled) ----
       if (shouldEmitProgress) {
-        const elapsed = (now - t.speedTrack.time) / 1000;
         const bytesNow = Math.min(t.receivedCount * CHUNK_SIZE, t.metadata.size);
-        let speed = 0;
-        if (elapsed >= 0.5) {
-          speed = (bytesNow - t.speedTrack.bytes) / elapsed;
+        const rElapsed = (now - t.speedTrack.time) / 1000;
+
+        // Only recalculate speed every ~0.8s to get a stable reading
+        if (rElapsed >= 0.8) {
+          const rawSpeed = (bytesNow - t.speedTrack.bytes) / rElapsed;
+          // EMA smoothing: 50% weight to new reading, 50% to history
+          t._smoothedSpeed = t._smoothedSpeed !== undefined
+            ? t._smoothedSpeed * 0.5 + rawSpeed * 0.5
+            : rawSpeed;
           t.speedTrack = { time: now, bytes: bytesNow };
         }
+
         this.callbacks.onProgress?.({
           fileName: t.metadata.name, fileIndex: fIdx,
           progress: (t.receivedCount / t.metadata.totalChunks) * 100,
-          bytesSent: bytesNow, totalBytes: t.metadata.size,
-          speed, isSender: false,
-          chunkIndex: t.receivedCount, totalChunks: t.metadata.totalChunks,
+          bytesSent: bytesNow,
+          totalBytes: t.metadata.size,
+          speed: t._smoothedSpeed ?? 0, // Persists last known speed, no flicker
+          isSender: false,
+          chunkIndex: t.receivedCount,
+          totalChunks: t.metadata.totalChunks,
           activePeers: this.peers.size,
         });
       }
