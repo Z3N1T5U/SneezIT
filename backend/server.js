@@ -109,11 +109,10 @@ function findRoomBySocketId(socketId) {
 }
 
 /**
- * Get the other peer's socket ID in a room.
- * In a 2-person room, this finds "the person who isn't me."
+ * Get all other peers' socket IDs in a room.
  */
-function getOtherPeer(room, mySocketId) {
-  return room.peers.find((id) => id !== mySocketId);
+function getOtherPeers(room, mySocketId) {
+  return room.peers.filter((id) => id !== mySocketId);
 }
 
 // ============================================================================
@@ -230,9 +229,9 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Validate: is the room full? (max 2 peers for P2P)
-    if (room.peers.length >= 2) {
-      socket.emit('error-message', { message: 'Room is full. Only 2 peers can connect.' });
+    // Validate: is the room full? (max 20 peers for Mesh P2P)
+    if (room.peers.length >= 20) {
+      socket.emit('error-message', { message: 'Room is full. Only 20 peers can connect.' });
       return;
     }
 
@@ -242,24 +241,24 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // Tell the joiner they successfully joined, and who else is in the room
+    const existingPeers = [...room.peers]; // Clone the array so it doesn't include the joiner
+    
     // Add the joiner to the room
     room.peers.push(socket.id);
     socket.join(normalizedId);
 
-    // Tell the joiner they successfully joined
     socket.emit('room-joined', {
       roomId: normalizedId,
-      peerId: room.peers[0], // The ID of the other peer already in the room
+      peers: existingPeers, // Array of existing peers
     });
 
-    // Tell the existing peer that someone joined — they should start the
-    // WebRTC offer process now
-    const otherPeerId = getOtherPeer(room, socket.id);
-    if (otherPeerId) {
-      io.to(otherPeerId).emit('peer-joined', {
+    // Tell all existing peers that someone new joined
+    existingPeers.forEach((peerId) => {
+      io.to(peerId).emit('peer-joined', {
         peerId: socket.id,
       });
-    }
+    });
 
     log(`Peer ${socket.id} joined room ${normalizedId}. Peers in room: ${room.peers.length}`);
   });
@@ -275,14 +274,19 @@ io.on('connection', (socket) => {
   //   - ICE candidates (network addresses)
   //   - Data channel configuration
 
-  socket.on('offer', ({ offer, roomId }) => {
+  socket.on('offer', ({ offer, roomId, targetPeerId }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    const otherPeer = getOtherPeer(room, socket.id);
-    if (otherPeer) {
-      io.to(otherPeer).emit('offer', { offer, from: socket.id });
-      log(`SDP offer forwarded in room ${roomId}`);
+    if (targetPeerId && room.peers.includes(targetPeerId)) {
+      io.to(targetPeerId).emit('offer', { offer, from: socket.id });
+      log(`SDP offer forwarded in room ${roomId} to ${targetPeerId}`);
+    } else {
+      // Fallback/broadcast to all other peers if no specific target
+      const otherPeers = getOtherPeers(room, socket.id);
+      otherPeers.forEach(peerId => {
+        io.to(peerId).emit('offer', { offer, from: socket.id });
+      });
     }
   });
 
@@ -293,14 +297,18 @@ io.on('connection', (socket) => {
   // confirming which codecs/config they support. After this exchange,
   // both peers know how to communicate.
 
-  socket.on('answer', ({ answer, roomId }) => {
+  socket.on('answer', ({ answer, roomId, targetPeerId }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    const otherPeer = getOtherPeer(room, socket.id);
-    if (otherPeer) {
-      io.to(otherPeer).emit('answer', { answer, from: socket.id });
-      log(`SDP answer forwarded in room ${roomId}`);
+    if (targetPeerId && room.peers.includes(targetPeerId)) {
+      io.to(targetPeerId).emit('answer', { answer, from: socket.id });
+      log(`SDP answer forwarded in room ${roomId} to ${targetPeerId}`);
+    } else {
+      const otherPeers = getOtherPeers(room, socket.id);
+      otherPeers.forEach(peerId => {
+        io.to(peerId).emit('answer', { answer, from: socket.id });
+      });
     }
   });
 
@@ -315,14 +323,17 @@ io.on('connection', (socket) => {
   // The peers try each candidate pair until they find one that works.
   // This is why WebRTC can traverse most NATs and firewalls.
 
-  socket.on('ice-candidate', ({ candidate, roomId }) => {
+  socket.on('ice-candidate', ({ candidate, roomId, targetPeerId }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    const otherPeer = getOtherPeer(room, socket.id);
-    if (otherPeer) {
-      io.to(otherPeer).emit('ice-candidate', { candidate, from: socket.id });
-      // Not logging every ICE candidate — there can be dozens per connection
+    if (targetPeerId && room.peers.includes(targetPeerId)) {
+      io.to(targetPeerId).emit('ice-candidate', { candidate, from: socket.id });
+    } else {
+      const otherPeers = getOtherPeers(room, socket.id);
+      otherPeers.forEach(peerId => {
+        io.to(peerId).emit('ice-candidate', { candidate, from: socket.id });
+      });
     }
   });
 
@@ -337,14 +348,14 @@ io.on('connection', (socket) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    const otherPeer = getOtherPeer(room, socket.id);
-    if (otherPeer) {
-      io.to(otherPeer).emit('chat-message', {
+    const otherPeers = getOtherPeers(room, socket.id);
+    otherPeers.forEach(peerId => {
+      io.to(peerId).emit('chat-message', {
         message,
         from: socket.id,
         timestamp: Date.now(),
       });
-    }
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -362,14 +373,17 @@ io.on('connection', (socket) => {
    * When one peer detects that P2P isn't going to work, it tells the other
    * peer "hey, let's use the server as a relay instead."
    */
-  socket.on('relay-signal', ({ roomId, data }) => {
+  socket.on('relay-signal', ({ roomId, data, targetPeerId }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    const otherPeer = getOtherPeer(room, socket.id);
-    if (otherPeer) {
-      io.to(otherPeer).emit('relay-signal', { data, from: socket.id });
-      log(`Relay signal forwarded in room ${roomId}`);
+    if (targetPeerId && room.peers.includes(targetPeerId)) {
+      io.to(targetPeerId).emit('relay-signal', { data, from: socket.id });
+    } else {
+      const otherPeers = getOtherPeers(room, socket.id);
+      otherPeers.forEach(peerId => {
+        io.to(peerId).emit('relay-signal', { data, from: socket.id });
+      });
     }
   });
 
@@ -378,14 +392,17 @@ io.on('connection', (socket) => {
    * Before sending actual file data, the sender tells the receiver about
    * the file: name, size, MIME type, and how many chunks to expect.
    */
-  socket.on('relay-meta', ({ roomId, metadata }) => {
+  socket.on('relay-meta', ({ roomId, metadata, targetPeerId }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    const otherPeer = getOtherPeer(room, socket.id);
-    if (otherPeer) {
-      io.to(otherPeer).emit('relay-meta', { metadata, from: socket.id });
-      log(`Relay metadata forwarded in room ${roomId}: ${metadata?.name} (${metadata?.size} bytes)`);
+    if (targetPeerId && room.peers.includes(targetPeerId)) {
+      io.to(targetPeerId).emit('relay-meta', { metadata, from: socket.id });
+    } else {
+      const otherPeers = getOtherPeers(room, socket.id);
+      otherPeers.forEach(peerId => {
+        io.to(peerId).emit('relay-meta', { metadata, from: socket.id });
+      });
     }
   });
 
@@ -395,22 +412,19 @@ io.on('connection', (socket) => {
    * and reassembled on the receiver side. Each chunk includes an index so
    * the receiver can put them back in order.
    */
-  socket.on('relay-data', ({ roomId, chunk, index, totalChunks }) => {
+  socket.on('relay-data', ({ roomId, chunk, index, totalChunks, targetPeerId }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    const otherPeer = getOtherPeer(room, socket.id);
-    if (otherPeer) {
-      io.to(otherPeer).emit('relay-data', {
-        chunk,
-        index,
-        totalChunks,
-        from: socket.id,
+    const payload = { chunk, index, totalChunks, from: socket.id };
+    
+    if (targetPeerId && room.peers.includes(targetPeerId)) {
+      io.to(targetPeerId).emit('relay-data', payload);
+    } else {
+      const otherPeers = getOtherPeers(room, socket.id);
+      otherPeers.forEach(peerId => {
+        io.to(peerId).emit('relay-data', payload);
       });
-      // Log progress every 10% to avoid flooding the console
-      if (totalChunks && index % Math.max(1, Math.floor(totalChunks / 10)) === 0) {
-        log(`Relay progress in room ${roomId}: chunk ${index + 1}/${totalChunks}`);
-      }
     }
   });
 
@@ -431,14 +445,15 @@ io.on('connection', (socket) => {
     // Remove the disconnected peer from the room
     room.peers = room.peers.filter((id) => id !== socket.id);
 
-    // Notify the remaining peer (if any) that their partner left
-    const remainingPeer = room.peers[0];
-    if (remainingPeer) {
+    // Notify remaining peers that their partner left
+    const remainingPeers = room.peers;
+    remainingPeers.forEach((remainingPeer) => {
       io.to(remainingPeer).emit('peer-disconnected', {
         peerId: socket.id,
       });
-      log(`Notified ${remainingPeer} that peer left room ${room.id}`);
-    }
+    });
+    
+    log(`Notified ${remainingPeers.length} peers that ${socket.id} left room ${room.id}`);
 
     // If the room is now empty, delete it immediately
     if (room.peers.length === 0) {
