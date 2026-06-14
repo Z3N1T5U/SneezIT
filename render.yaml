@@ -1,0 +1,17 @@
+# ============================================================================
+# Render Deployment Config (Backend)
+# ============================================================================
+# This tells Render.com how to build and run the signaling server.
+# Render supports persistent WebSocket connections (unlike Vercel).
+
+services:
+  - type: web
+    name: peerdrop-signaling
+    runtime: node
+    buildCommand: cd backend && npm install
+    startCommand: cd backend && npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
