@@ -19,12 +19,26 @@ export default function ChatPanel({ messages, onSendMessage, peerConnected }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const [lastSeenCount, setLastSeenCount] = useState(0);
+
   // Open chat panel when first message arrives
   useEffect(() => {
-    if (messages.length > 0 && !isOpen) {
+    if (messages.length === 1 && !isOpen) {
       setIsOpen(true);
     }
   }, [messages.length]);
+
+  // Update last seen count when panel is open
+  const peerMessages = messages.filter(m => m.from === 'peer');
+  const peerMessagesCount = peerMessages.length;
+
+  useEffect(() => {
+    if (isOpen) {
+      setLastSeenCount(peerMessagesCount);
+    }
+  }, [isOpen, peerMessagesCount]);
+
+  const unreadCount = isOpen ? 0 : Math.max(0, peerMessagesCount - lastSeenCount);
 
   const handleSend = () => {
     const text = inputValue.trim();
@@ -41,8 +55,6 @@ export default function ChatPanel({ messages, onSendMessage, peerConnected }) {
       handleSend();
     }
   };
-
-  const unreadCount = isOpen ? 0 : messages.filter(m => m.from === 'peer' && !m.read).length;
 
   return (
     <>
