@@ -28,6 +28,7 @@ import {
   Send, Loader2, Hash, Activity
 } from 'lucide-react';
 import { connectSocket, resetSocket } from './lib/socket';
+import { generateEncryptionKey, exportKey, importKey } from './lib/crypto';
 import { PeerConnection } from './lib/webrtc';
 import { formatFileSize, formatSpeed, getFileIcon } from './lib/fileUtils';
 import ChatPanel from './components/ChatPanel';
@@ -77,22 +78,28 @@ export default function App() {
   // Chat
   const [chatMessages, setChatMessages] = useState([]);
 
+  // Mesh / peers
+  const [peerCount, setPeerCount] = useState(0);
+
   // --------------------------------------------------------------------------
   // Refs (for values that socket handlers need to READ — avoids stale closures)
   // --------------------------------------------------------------------------
   const peerConnectionRef = useRef(null);
   const fileInputRef = useRef(null);
   const socketRef = useRef(null);
+  const encryptionKeyRef = useRef(null);
 
   // These refs mirror the state values so socket handlers always get fresh values
   const isSenderRef = useRef(false);
   const roomIdRef = useRef('');
   const allCompleteRef = useRef(false);
+  const appStateRef = useRef('idle');
 
   // Keep refs in sync with state
   useEffect(() => { isSenderRef.current = isSender; }, [isSender]);
   useEffect(() => { roomIdRef.current = roomId; }, [roomId]);
   useEffect(() => { allCompleteRef.current = allComplete; }, [allComplete]);
+  useEffect(() => { appStateRef.current = appState; }, [appState]);
 
   // --------------------------------------------------------------------------
   // Parse URL for room code on load
@@ -100,10 +107,22 @@ export default function App() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const urlRoom = params.get('room');
+    const hashParams = new URLSearchParams(window.location.hash.slice(1));
+    const urlKey = hashParams.get('key');
+    
     if (urlRoom) {
       const code = urlRoom.toUpperCase();
       setJoinRoomInput(code);
       setStatusMessage(`Room code "${code}" detected from link — enter it and click Join!`);
+      
+      if (urlKey) {
+        importKey(urlKey).then(key => {
+          encryptionKeyRef.current = key;
+        }).catch(err => {
+          console.error("Failed to import key:", err);
+          setErrorMessage("Invalid encryption key in URL.");
+        });
+      }
     }
   }, []);
 
@@ -117,28 +136,30 @@ export default function App() {
     };
   }, []);
 
-  // ==========================================================================
-  // createPeerConnection — builds the WebRTC peer + wires all callbacks
-  // ==========================================================================
-  const createPeerConnection = useCallback((socket, currentRoomId, asSender) => {
-    // Destroy any existing connection cleanly
+  const getOrCreatePeerConnection = useCallback((socket, currentRoomId, asSender) => {
     if (peerConnectionRef.current) {
-      peerConnectionRef.current.destroy();
-      peerConnectionRef.current = null;
+      return peerConnectionRef.current;
     }
 
     const pc = new PeerConnection(socket, currentRoomId, asSender, {
+      encryptionKey: encryptionKeyRef.current,
       onStatus: (msg) => setStatusMessage(msg),
       onError: (msg) => setErrorMessage(msg),
 
       onConnected: ({ relay }) => {
         setIsRelay(relay);
-        setAppState('connected');
-        setStatusMessage(
-          relay
-            ? '⚡ Connected via server relay (P2P blocked by firewall)'
-            : '🎉 Direct P2P connection established!'
-        );
+        // Only move to 'connected' if we're still in a handshake state.
+        // Never override 'transferring' or 'complete' — a new peer joining
+        // mid-transfer completes ICE but the overall session stays active.
+        const state = appStateRef.current;
+        if (state === 'connecting' || state === 'joining') {
+          setAppState('connected');
+          setStatusMessage(
+            relay
+              ? '⚡ Connected via server relay (P2P blocked by firewall)'
+              : '🎉 Direct P2P connection established!'
+          );
+        }
       },
 
       onIceState: (state) => setIceState(state),
@@ -149,19 +170,38 @@ export default function App() {
       },
 
       onDataChannelOpen: () => {
-        setAppState('connected');
-        setStatusMessage('Data channel open — ready to transfer files!');
+        // Only switch to 'connected' if we're not already transferring
+        if (appStateRef.current !== 'transferring' && appStateRef.current !== 'complete') {
+          setAppState('connected');
+          setStatusMessage('Data channel open — ready to transfer files!');
+        }
+        // If we're already transferring (new peer joined mid-transfer),
+        // the swarm handles re-sending the file list on DC open automatically.
       },
 
       onFileList: (files) => {
-        setFileList(files);
+        setFileList(prev => {
+          // Avoid duplicates if file-list is received again (e.g. peer rejoin)
+          const existing = new Set(prev.map(f => f.fileIndex));
+          const newFiles = files.filter(f => !existing.has(f.fileIndex));
+          return [...prev, ...newFiles];
+        });
         setAppState('transferring');
+        setStatusMessage('Receiving files...');
       },
 
       onTransferStart: (files) => {
         setFileList(files);
         setAppState('transferring');
-        setStatusMessage('Transfer started...');
+        setStatusMessage(`Sending ${files.length} file${files.length > 1 ? 's' : ''} to ${peerCount} peer${peerCount > 1 ? 's' : ''}...`);
+      },
+
+      onPeerCountChange: (count) => {
+        setPeerCount(count);
+      },
+
+      onResumed: ({ fileIndex, chunksHave, totalChunks }) => {
+        setStatusMessage(`↺ Auto-resuming from ${Math.round(chunksHave/totalChunks*100)}%...`);
       },
 
       onFileStart: (meta) => {
@@ -201,6 +241,23 @@ export default function App() {
 
       onChatMessage: (msg) => {
         setChatMessages(prev => [...prev, msg]);
+      },
+
+      onPeerLeft: ({ peerId, remainingPeers }) => {
+        // Don't do anything if the transfer is done
+        if (allCompleteRef.current) return;
+        // If there are still other peers connected, just show a toast
+        if (remainingPeers > 0) {
+          setErrorMessage('A peer has left the room. Transfer continues with remaining peers.');
+          return;
+        }
+        // All peers gone
+        const state = appStateRef.current;
+        setErrorMessage('Your peer has left the room.');
+        // Don’t reset from transferring — the user may want to wait for a reconnect
+        if (state !== 'transferring' && state !== 'complete') {
+          setAppState('waiting');
+        }
       },
     });
 
@@ -242,6 +299,9 @@ export default function App() {
     socket.on('room-created', ({ roomId: id }) => {
       console.log('[Socket] Room created:', id);
       roomIdRef.current = id;   // Update ref immediately — don't wait for state
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.roomId = id;
+      }
       setRoomId(id);
       setAppState('waiting');
       setStatusMessage('Room created! Share the code or link with your peer.');
@@ -251,35 +311,42 @@ export default function App() {
     socket.on('room-joined', ({ roomId: id }) => {
       console.log('[Socket] Room joined:', id);
       roomIdRef.current = id;
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.roomId = id;
+      }
       setRoomId(id);
       setAppState('connecting');
       setStatusMessage('Joined room! Waiting for sender...');
     });
 
-    // ---- SENDER: The other peer joined the room → start WebRTC handshake ----
+    // ---- SENDER: The other peer joined the room ----
     socket.on('peer-joined', ({ peerId }) => {
       console.log('[Socket] Peer joined:', peerId);
       setAppState('connecting');
-      setStatusMessage('Peer joined! Establishing WebRTC connection...');
-
-      // Read from refs — guaranteed to be current values
-      const currentRoomId = roomIdRef.current;
-      const currentIsSender = isSenderRef.current;
-
-      console.log('[Socket] peer-joined handler — isSender:', currentIsSender, 'roomId:', currentRoomId);
-
-      if (currentIsSender && currentRoomId) {
-        // We are the sender: create the WebRTC offer
-        createPeerConnection(socket, currentRoomId, true);
-      }
+      setStatusMessage('Peer joined! Mesh network active.');
     });
 
     // ---- Both peers: the other peer left ----
-    socket.on('peer-disconnected', () => {
-      console.log('[Socket] Peer disconnected');
-      setErrorMessage('Your peer has left the room.');
+    socket.on('peer-disconnected', ({ peerId }) => {
+      console.log('[Socket] Peer disconnected:', peerId);
+      // Swarm manager handles peer removal internally via its own socket handler.
+      // Here we just update the app state as a safety net.
       if (!allCompleteRef.current) {
-        setAppState('waiting');
+        const state = appStateRef.current;
+        if (state !== 'transferring' && state !== 'complete') {
+          setErrorMessage('Your peer has left the room.');
+          setAppState('waiting');
+        }
+        // If transferring, let the swarm handle it (it will show a toast)
+      }
+    });
+
+    // ---- Socket reconnected — do NOT re-emit create-room/join-room ----
+    // The server lost our room on reconnect. We show an error and let the user decide.
+    socket.on('reconnect', () => {
+      console.log('[Socket] Reconnected to server. Previous room is gone.');
+      if (appStateRef.current !== 'idle' && appStateRef.current !== 'complete') {
+        setErrorMessage('Lost connection to server and reconnected. Your room session ended. Please start a new transfer.');
       }
     });
 
@@ -310,31 +377,67 @@ export default function App() {
     }
 
     return socket;
-  }, [createPeerConnection]);
+  }, [getOrCreatePeerConnection]);
 
   // ==========================================================================
   // User Actions
   // ==========================================================================
 
-  const handleCreateRoom = () => {
+  const handleCreateRoom = async () => {
     // Set sender ref immediately (before async state update)
     isSenderRef.current = true;
     setIsSender(true);
     setErrorMessage('');
     setAppState('creating');
 
+    try {
+      const key = await generateEncryptionKey();
+      encryptionKeyRef.current = key;
+      const exported = await exportKey(key);
+      window.location.hash = `key=${exported}`;
+    } catch (err) {
+      setErrorMessage(`Failed to generate encryption key: ${err.message}`);
+      return;
+    }
+
     setupSocket((socket) => {
       console.log('[App] Socket ready — emitting create-room');
+      getOrCreatePeerConnection(socket, '', true); // Instantiate the Swarm Manager
       socket.emit('create-room');
     });
   };
 
-  const handleJoinRoom = () => {
-    const code = joinRoomInput.trim().toUpperCase();
+  const handleJoinRoom = async () => {
+    // Extract room and key if a full URL was pasted
+    let code = joinRoomInput.trim();
+    let pastedKey = null;
+    try {
+      const url = new URL(code);
+      code = url.searchParams.get('room') || '';
+      pastedKey = new URLSearchParams(url.hash.slice(1)).get('key');
+    } catch {
+      // Not a full URL, that's fine
+    }
+    
+    code = code.toUpperCase().replace(/[^A-Z0-9]/g, '');
+
     if (!code || code.length < 4) {
-      setErrorMessage('Please enter a valid room code');
+      setErrorMessage('Please enter a valid room code or paste the full link');
       return;
     }
+    
+    // Process key if pasted from URL
+    if (pastedKey) {
+      try {
+        encryptionKeyRef.current = await importKey(pastedKey);
+      } catch (e) {
+        console.error('Failed to import pasted key', e);
+        setErrorMessage('Could not read encryption key from link. File transfer will be unencrypted.');
+      }
+    }
+    // NOTE: encryptionKeyRef.current may be null if user typed the code manually.
+    // That is allowed — the transfer will proceed without encryption.
+    // The sender sets the key in the URL hash, receiver only gets it via the link.
 
     // Set receiver refs immediately
     isSenderRef.current = false;
@@ -346,10 +449,8 @@ export default function App() {
 
     setupSocket((socket) => {
       console.log('[App] Socket ready — emitting join-room:', code);
+      getOrCreatePeerConnection(socket, code, false); // Instantiate the Swarm Manager
       socket.emit('join-room', { roomId: code });
-
-      // Receiver sets up peer connection now so it's ready when the offer arrives
-      createPeerConnection(socket, code, false);
     });
   };
 
@@ -390,7 +491,7 @@ export default function App() {
   };
 
   const handleCopyLink = () => {
-    const url = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
+    const url = `${window.location.origin}${window.location.pathname}?room=${roomId}${window.location.hash}`;
     navigator.clipboard.writeText(url).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2500);
@@ -420,6 +521,7 @@ export default function App() {
     setIsSender(false);
     setIsRelay(false);
     setIceState({ gathering: 'new', connection: 'new' });
+    setPeerCount(0);
     window.history.replaceState({}, '', window.location.pathname);
   };
 
@@ -471,6 +573,15 @@ export default function App() {
 
           {/* Right side badges */}
           <div className="flex items-center gap-3">
+
+            {/* Active peer count badge (shown when connected) */}
+            {isConnected && peerCount > 0 && (
+              <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-purple-500/10 text-purple-300 border border-purple-500/20">
+                <Users size={12} />
+                {peerCount} peer{peerCount !== 1 ? 's' : ''}
+              </div>
+            )}
+
             {/* Connection badge */}
             {appState !== 'idle' && appState !== 'creating' && (
               <div className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border ${
@@ -853,7 +964,7 @@ export default function App() {
                     </div>
 
                     {/* Stats Grid */}
-                    <div className="grid grid-cols-3 gap-3">
+                    <div className="grid grid-cols-4 gap-2">
                       <div className="bg-white/[0.04] rounded-xl p-3 text-center">
                         <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Speed</p>
                         <p className="text-sm font-bold text-white">
@@ -870,10 +981,19 @@ export default function App() {
                       <div className="bg-white/[0.04] rounded-xl p-3 text-center">
                         <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Chunks</p>
                         <p className="text-sm font-bold text-white">
-                          {progress.chunkIndex + 1}/{progress.totalChunks}
+                          {progress.chunkIndex}/{progress.totalChunks}
+                        </p>
+                      </div>
+                      <div className="bg-purple-500/[0.08] border border-purple-500/10 rounded-xl p-3 text-center">
+                        <p className="text-[10px] text-purple-400 uppercase tracking-wider mb-1">
+                          {progress.isSender ? 'Seeders' : 'Peers'}
+                        </p>
+                        <p className="text-sm font-bold text-purple-300">
+                          {progress.activePeers ?? peerCount}
                         </p>
                       </div>
                     </div>
+
                   </div>
                 )}
 
@@ -929,23 +1049,39 @@ export default function App() {
                 <h2 className="text-2xl font-bold text-white mb-1.5">Transfer Complete! 🎉</h2>
                 <p className="text-sm text-gray-400 mb-6">{statusMessage}</p>
 
-                <div className="space-y-2 text-left mb-6">
+                <div className="space-y-3 text-left mb-6">
                   {completedFiles.map((file, i) => (
-                    <div key={i} className="flex items-center gap-3 bg-white/[0.04] rounded-xl px-4 py-3">
-                      <span className={file.verified ? 'text-green-400' : 'text-red-400'}>
-                        {file.verified ? <ShieldCheck size={18} /> : <ShieldX size={18} />}
-                      </span>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm text-white font-medium truncate">{file.name || file.fileName}</p>
-                        <p className="text-[11px] text-gray-500 font-mono">
-                          SHA-256: {(file.hash || file.receivedHash || '').substring(0, 20)}...
-                        </p>
+                    <div key={i} className="bg-white/[0.04] rounded-xl px-4 py-3">
+                      <div className="flex items-center gap-3 mb-2">
+                        <span className={file.verified ? 'text-green-400' : 'text-red-400'}>
+                          {file.verified ? <ShieldCheck size={18} /> : <ShieldX size={18} />}
+                        </span>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm text-white font-medium truncate">{file.name}</p>
+                          <p className="text-[11px] text-gray-500 font-mono">
+                            {file.checksum
+                              ? `SHA-256: ${file.checksum.substring(0, 20)}...`
+                              : 'AES-GCM Authenticated'}
+                          </p>
+                        </div>
+                        <span className={`text-[10px] px-2 py-0.5 rounded-lg font-bold flex-shrink-0 ${
+                          file.verified ? 'bg-green-500/15 text-green-400' : 'bg-red-500/15 text-red-400'
+                        }`}>
+                          {file.verified ? 'VERIFIED' : 'MISMATCH'}
+                        </span>
                       </div>
-                      <span className={`text-[10px] px-2 py-0.5 rounded-lg font-bold ${
-                        file.verified ? 'bg-green-500/15 text-green-400' : 'bg-red-500/15 text-red-400'
-                      }`}>
-                        {file.verified ? 'VERIFIED' : 'MISMATCH'}
-                      </span>
+
+                      {/* Download button (only shows for receiver — sender has no URL) */}
+                      {file.url && (
+                        <a
+                          href={file.url}
+                          download={file.name}
+                          className="mt-1 flex items-center justify-center gap-2 w-full py-2 rounded-lg bg-green-600/20 hover:bg-green-600/30 text-green-400 text-xs font-semibold transition-all border border-green-500/20 hover:border-green-500/40"
+                        >
+                          <Download size={13} />
+                          Download {file.name}
+                        </a>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -961,6 +1097,7 @@ export default function App() {
               </div>
             </div>
           )}
+
 
           {/* ================================================================
               ERROR MESSAGE (persistent toast)
