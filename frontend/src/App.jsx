@@ -32,6 +32,7 @@ import { generateEncryptionKey, exportKey, importKey } from './lib/crypto';
 import { PeerConnection } from './lib/webrtc';
 import { formatFileSize, formatSpeed, getFileIcon } from './lib/fileUtils';
 import ChatPanel from './components/ChatPanel';
+import PixelBlast from './components/PixelBlast';
 
 // ============================================================================
 // File Icon Mapper
@@ -594,6 +595,24 @@ export default function App() {
   return (
     <div className="min-h-screen relative">
       {/* Animated Mesh Background */}
+      <div className="fixed inset-0 z-0 pointer-events-none mix-blend-screen opacity-70">
+        <PixelBlast
+          variant="circle"
+          pixelSize={6}
+          color="#B497CF"
+          patternScale={3}
+          patternDensity={1.2}
+          pixelSizeJitter={0.5}
+          enableRipples={false}
+          liquid
+          liquidStrength={0.12}
+          liquidRadius={1.2}
+          liquidWobbleSpeed={5}
+          speed={0.6}
+          edgeFade={0.25}
+          transparent
+        />
+      </div>
       <div className="bg-mesh" />
 
       {/* ====================================================================
