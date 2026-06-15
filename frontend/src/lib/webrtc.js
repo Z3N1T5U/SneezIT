@@ -327,6 +327,11 @@ export class PeerConnection {
     if (!t) return;
     if (!t.peerBitfields.has(peerId)) t.peerBitfields.set(peerId, new Uint8Array(t.metadata.totalChunks));
     t.peerBitfields.get(peerId)[chunkIndex] = 1;
+    
+    // Log true mesh swarming: if this chunk came from someone who isn't the original sender
+    if (!this.isSender && peerId !== t.originalSenderId) {
+      console.log(`[Swarm] Mesh active! Peer ${peerId.slice(0,6)} has chunk ${chunkIndex}`);
+    }
   }
 
   // ==========================================================================
@@ -430,6 +435,10 @@ export class PeerConnection {
           .map(([pid]) => pid);
         if (!candidates.length) continue;
         const target = candidates[Math.floor(Math.random() * candidates.length)];
+        
+        // Track the original sender to help with logging later
+        if (!t.originalSenderId) t.originalSenderId = target;
+        
         t.pendingRequests.add(i);
         setTimeout(() => t.pendingRequests.delete(i), 5000);
         this._sendTo(target, { type: 'request-chunk', fileIndex: fIdx, chunkIndex: i });
@@ -440,12 +449,14 @@ export class PeerConnection {
   }
 
   // ==========================================================================
-  // Chunk serving
+  // Chunk serving (Sender or Seeder)
   // ==========================================================================
 
   async _handleChunkRequest(peerId, fileIndex, chunkIndex) {
     const t = this.activeTransfers.get(fileIndex);
-    if (!t || t.myBitfield[chunkIndex] !== 1) return;
+    if (!t) return;
+    if (t.myBitfield[chunkIndex] !== 1) return; // I don't have it either
+
     try {
       let plain;
       if (t.file) {
@@ -475,8 +486,14 @@ export class PeerConnection {
   async _handleChunkData(peerId, fileIndex, chunkIndex, payload) {
     const t = this.activeTransfers.get(fileIndex);
     if (!t || t.myBitfield[chunkIndex] === 1) return; // Duplicate
+    if (t.isFinalized) return; // Drop late stragglers if we already finished
+
     try {
       const data = this.encryptionKey ? await decryptChunk(this.encryptionKey, payload) : payload;
+      
+      // Double check in case finalized while decrypting
+      if (t.isFinalized) return;
+      
       await t.storage.writeChunk(chunkIndex * CHUNK_SIZE, data);
       t.myBitfield[chunkIndex] = 1;
       t.receivedCount++;
@@ -492,7 +509,10 @@ export class PeerConnection {
 
   async _finalize(fileIndex) {
     const t = this.activeTransfers.get(fileIndex);
-    if (!t?.storage) return;
+    if (!t?.storage || t.isFinalized) return;
+    
+    t.isFinalized = true; // Mark to prevent closed-stream writes from lagging chunks
+    
     this.callbacks.onProgress?.({
       fileName: t.metadata.name, fileIndex,
       progress: 100, bytesSent: t.metadata.size, totalBytes: t.metadata.size,
