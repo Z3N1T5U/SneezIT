@@ -33,6 +33,7 @@ import { PeerConnection } from './lib/webrtc';
 import { formatFileSize, formatSpeed, getFileIcon } from './lib/fileUtils';
 import ChatPanel from './components/ChatPanel';
 import PixelBlast from './components/PixelBlast';
+import PixelCard from './components/PixelCard';
 
 // ============================================================================
 // File Icon Mapper
@@ -713,53 +714,57 @@ export default function App() {
               {/* Cards */}
               <div className="grid md:grid-cols-2 gap-4 max-w-2xl mx-auto">
                 {/* SEND */}
-                <button
-                  onClick={handleCreateRoom}
-                  id="create-room-btn"
-                  className="glass group hover:bg-white/[0.07] transition-all duration-300 p-7 text-left cursor-pointer rounded-2xl"
-                >
-                  <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform shadow-lg">
-                    <Upload size={22} className="text-white" />
-                  </div>
-                  <h3 className="text-lg font-bold text-white mb-1">Send Files</h3>
-                  <p className="text-sm text-gray-400 mb-4">
-                    Create a secure room and share the code with your recipient
-                  </p>
-                  <div className="flex items-center gap-1 text-brand-400 text-sm font-semibold group-hover:gap-2 transition-all">
-                    Create Room <ChevronRight size={16} />
-                  </div>
-                </button>
+                <PixelCard variant="blue" className="rounded-2xl">
+                  <button
+                    onClick={handleCreateRoom}
+                    id="create-room-btn"
+                    className="group hover:bg-white/[0.07] transition-all duration-300 p-7 text-left cursor-pointer w-full h-full flex flex-col items-start"
+                  >
+                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform shadow-lg">
+                      <Upload size={22} className="text-white" />
+                    </div>
+                    <h3 className="text-lg font-bold text-white mb-1">Send Files</h3>
+                    <p className="text-sm text-gray-400 mb-4">
+                      Create a secure room and share the code with your recipient
+                    </p>
+                    <div className="flex items-center gap-1 text-brand-400 text-sm font-semibold group-hover:gap-2 transition-all mt-auto">
+                      Create Room <ChevronRight size={16} />
+                    </div>
+                  </button>
+                </PixelCard>
 
                 {/* RECEIVE */}
-                <div className="glass p-7 rounded-2xl">
-                  <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-green-500 to-emerald-700 flex items-center justify-center mb-4 shadow-lg">
-                    <Download size={22} className="text-white" />
+                <PixelCard variant="blue" className="rounded-2xl">
+                  <div className="p-7 h-full flex flex-col">
+                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-green-500 to-emerald-700 flex items-center justify-center mb-4 shadow-lg">
+                      <Download size={22} className="text-white" />
+                    </div>
+                    <h3 className="text-lg font-bold text-white mb-1">Receive Files</h3>
+                    <p className="text-sm text-gray-400 mb-3">
+                      Enter the 6-character room code from the sender
+                    </p>
+                    <div className="flex gap-2 mt-auto">
+                      <input
+                        type="text"
+                        value={joinRoomInput}
+                        onChange={(e) => setJoinRoomInput(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
+                        onKeyDown={(e) => e.key === 'Enter' && handleJoinRoom()}
+                        placeholder="e.g. AB3X7K"
+                        maxLength={6}
+                        id="join-room-input"
+                        className="flex-1 bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500/30 tracking-[0.2em] font-mono uppercase"
+                      />
+                      <button
+                        onClick={handleJoinRoom}
+                        disabled={joinRoomInput.trim().length < 4}
+                        id="join-room-btn"
+                        className="px-4 py-2.5 bg-green-600 hover:bg-green-500 text-white rounded-xl text-sm font-medium transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                      >
+                        <ArrowRight size={18} />
+                      </button>
+                    </div>
                   </div>
-                  <h3 className="text-lg font-bold text-white mb-1">Receive Files</h3>
-                  <p className="text-sm text-gray-400 mb-3">
-                    Enter the 6-character room code from the sender
-                  </p>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={joinRoomInput}
-                      onChange={(e) => setJoinRoomInput(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
-                      onKeyDown={(e) => e.key === 'Enter' && handleJoinRoom()}
-                      placeholder="e.g. AB3X7K"
-                      maxLength={6}
-                      id="join-room-input"
-                      className="flex-1 bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500/30 tracking-[0.2em] font-mono uppercase"
-                    />
-                    <button
-                      onClick={handleJoinRoom}
-                      disabled={joinRoomInput.trim().length < 4}
-                      id="join-room-btn"
-                      className="px-4 py-2.5 bg-green-600 hover:bg-green-500 text-white rounded-xl text-sm font-medium transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-                    >
-                      <ArrowRight size={18} />
-                    </button>
-                  </div>
-                </div>
+                </PixelCard>
               </div>
 
               {/* Feature Grid */}
@@ -770,11 +775,13 @@ export default function App() {
                   { icon: Globe,       label: 'Relay Fallback',   sub: 'Works on all nets', color: 'text-blue-400' },
                   { icon: Activity,    label: 'Live Stats',       sub: 'Speed & progress', color: 'text-green-400' },
                 ].map((f, i) => (
-                  <div key={i} className="glass rounded-xl py-4 px-3 text-center">
-                    <f.icon size={20} className={`${f.color} mx-auto mb-2`} />
-                    <p className="text-xs font-semibold text-white">{f.label}</p>
-                    <p className="text-[10px] text-gray-500 mt-0.5">{f.sub}</p>
-                  </div>
+                  <PixelCard key={i} variant="default" className="rounded-xl">
+                    <div className="py-4 px-3 text-center h-full flex flex-col items-center justify-center">
+                      <f.icon size={20} className={`${f.color} mb-2`} />
+                      <p className="text-xs font-semibold text-white">{f.label}</p>
+                      <p className="text-[10px] text-gray-500 mt-0.5">{f.sub}</p>
+                    </div>
+                  </PixelCard>
                 ))}
               </div>
             </div>
