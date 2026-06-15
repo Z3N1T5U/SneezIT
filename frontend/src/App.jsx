@@ -792,7 +792,8 @@ export default function App() {
           ================================================================ */}
           {(appState === 'creating' || appState === 'waiting') && (
             <div className="animate-slide-up max-w-md mx-auto mt-10">
-              <div className="glass-strong p-8 text-center rounded-2xl">
+              <PixelCard variant="blue" className="rounded-2xl">
+                <div className="p-8 text-center h-full flex flex-col">
                 <div className="w-16 h-16 rounded-2xl bg-brand-500/15 flex items-center justify-center mx-auto mb-5 animate-float">
                   <Users size={28} className="text-brand-400" />
                 </div>
@@ -832,7 +833,8 @@ export default function App() {
                   <Loader2 size={13} className="animate-spin" />
                   Waiting for someone to join...
                 </div>
-              </div>
+                </div>
+              </PixelCard>
             </div>
           )}
 
@@ -841,7 +843,8 @@ export default function App() {
           ================================================================ */}
           {(appState === 'joining' || appState === 'connecting') && (
             <div className="animate-slide-up max-w-md mx-auto mt-10">
-              <div className="glass-strong p-8 text-center rounded-2xl">
+              <PixelCard variant="blue" className="rounded-2xl">
+                <div className="p-8 text-center h-full flex flex-col">
                 <div className="w-16 h-16 rounded-2xl bg-yellow-500/15 flex items-center justify-center mx-auto mb-5">
                   <Radio size={28} className="text-yellow-400 animate-pulse" />
                 </div>
@@ -878,7 +881,8 @@ export default function App() {
                   <Loader2 size={13} className="animate-spin" />
                   {iceState.connection === 'checking' ? 'Testing network paths...' : 'Negotiating...'}
                 </div>
-              </div>
+                </div>
+              </PixelCard>
             </div>
           )}
 
@@ -887,7 +891,8 @@ export default function App() {
           ================================================================ */}
           {appState === 'connected' && isSender && (
             <div className="animate-slide-up max-w-2xl mx-auto mt-8">
-              <div className="glass-strong p-8 rounded-2xl">
+              <PixelCard variant="blue" className="rounded-2xl">
+                <div className="p-8 h-full flex flex-col">
                 {/* Header */}
                 <div className="flex items-center gap-3 mb-6">
                   <div className="w-10 h-10 rounded-xl bg-green-500/15 flex items-center justify-center">
@@ -963,7 +968,8 @@ export default function App() {
                     </button>
                   </div>
                 )}
-              </div>
+                </div>
+              </PixelCard>
             </div>
           )}
 
@@ -972,7 +978,8 @@ export default function App() {
           ================================================================ */}
           {appState === 'connected' && !isSender && (
             <div className="animate-slide-up max-w-md mx-auto mt-10">
-              <div className="glass-strong p-8 rounded-2xl text-center">
+              <PixelCard variant="blue" className="rounded-2xl">
+                <div className="p-8 text-center h-full flex flex-col">
                 <div className="w-16 h-16 rounded-2xl bg-green-500/15 flex items-center justify-center mx-auto mb-5 animate-float">
                   <Download size={28} className="text-green-400" />
                 </div>
@@ -990,7 +997,8 @@ export default function App() {
                   {isRelay ? <Globe size={11} /> : <Zap size={11} />}
                   {isRelay ? 'Server Relay Mode' : 'P2P Direct Connection'}
                 </div>
-              </div>
+                </div>
+              </PixelCard>
             </div>
           )}
 
@@ -999,7 +1007,8 @@ export default function App() {
           ================================================================ */}
           {appState === 'transferring' && (
             <div className="animate-slide-up max-w-2xl mx-auto mt-8">
-              <div className="glass-strong p-8 rounded-2xl">
+              <PixelCard variant="blue" className="rounded-2xl">
+                <div className="p-8 h-full flex flex-col">
                 <div className="flex items-center gap-3 mb-6">
                   <div className="w-10 h-10 rounded-xl bg-brand-500/15 flex items-center justify-center">
                     {isSender
@@ -1104,7 +1113,8 @@ export default function App() {
                     })}
                   </div>
                 )}
-              </div>
+                </div>
+              </PixelCard>
             </div>
           )}
 
@@ -1113,7 +1123,8 @@ export default function App() {
           ================================================================ */}
           {appState === 'complete' && (
             <div className="animate-slide-up max-w-md mx-auto mt-10">
-              <div className="glass-strong p-8 rounded-2xl text-center">
+              <PixelCard variant="blue" className="rounded-2xl">
+                <div className="p-8 text-center h-full flex flex-col">
                 <div className="w-20 h-20 rounded-full bg-green-500/15 flex items-center justify-center mx-auto mb-5 glow-green">
                   <ShieldCheck size={38} className="text-green-400" />
                 </div>
@@ -1166,7 +1177,8 @@ export default function App() {
                   <RefreshCw size={15} />
                   Start New Transfer
                 </button>
-              </div>
+                </div>
+              </PixelCard>
             </div>
           )}
 
