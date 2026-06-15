@@ -603,14 +603,14 @@ export default function App() {
         <div className="max-w-4xl mx-auto flex items-center justify-between">
           {/* Logo */}
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-brand-500 to-purple-600 flex items-center justify-center shadow-lg shadow-brand-500/20">
-              <Zap size={20} className="text-white" />
+            <div className="w-10 h-10 rounded-xl flex items-center justify-center overflow-hidden">
+              <img src="/logo.png" alt="SneezIT Logo" className="w-full h-full object-contain" />
             </div>
             <div>
-              <h1 className="text-xl font-bold bg-gradient-to-r from-white to-gray-300 bg-clip-text text-transparent leading-none">
-                PeerDrop
+              <h1 className="text-xl font-bold bg-gradient-to-r from-white to-gray-300 bg-clip-text text-transparent leading-none tracking-tight">
+                SneezIT
               </h1>
-              <p className="text-[10px] text-gray-500 tracking-wide">P2P FILE SHARING</p>
+              <p className="text-[10px] text-gray-400 tracking-widest uppercase mt-0.5">FILES "ACHOO" ACROSS BROWSERS</p>
             </div>
           </div>
 
@@ -674,7 +674,7 @@ export default function App() {
               <div className="text-center mb-10 mt-6">
                 <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-brand-500/10 border border-brand-500/20 text-brand-300 text-xs font-medium mb-5">
                   <Shield size={13} />
-                  End-to-End Encrypted · No Server Storage · WebRTC
+                  End-to-End Encrypted · No Server Storage
                 </div>
                 <h2 className="text-4xl md:text-5xl font-extrabold mb-4 leading-tight">
                   <span className="bg-gradient-to-r from-white via-gray-200 to-gray-400 bg-clip-text text-transparent">
@@ -1179,7 +1179,7 @@ export default function App() {
       ==================================================================== */}
       <footer className="fixed bottom-0 left-0 right-0 z-10 py-3 px-4 pointer-events-none">
         <p className="text-center text-[10px] text-gray-700">
-          Built with WebRTC + Socket.io · Files never leave your device · PeerDrop
+           · Built with WebRTC + Socket.io ·
         </p>
       </footer>
     </div>
