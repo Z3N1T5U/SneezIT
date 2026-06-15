@@ -22,6 +22,19 @@ export class FileStorage {
     this.opfsWritable = null;
     this.memoryChunks = []; // Fallback when OPFS is unavailable or quota exceeded
     this._initDone = false;
+    this._lock = Promise.resolve();
+  }
+
+  async _withLock(fn) {
+    const prev = this._lock;
+    let resolveLock;
+    this._lock = new Promise(r => resolveLock = r);
+    try {
+      await prev;
+      return await fn();
+    } finally {
+      resolveLock();
+    }
   }
 
   /**
