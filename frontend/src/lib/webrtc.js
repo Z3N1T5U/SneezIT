@@ -407,6 +407,24 @@ export class PeerConnection {
           totalChunks: t.metadata.totalChunks,
           activePeers: peerCount,
         });
+
+        // Trigger file completion for sender when it reaches 100%
+        if (pct >= 100 && !t.isFinalized) {
+          t.isFinalized = true;
+          this.callbacks.onFileComplete?.({
+            fileIndex: fIdx, name: t.metadata.name, size: t.metadata.size,
+            type: t.metadata.type, url: null, verified: true, checksum: 'AES-GCM Authenticated',
+          });
+          
+          // Check if ALL files are completely seeded
+          const allDone = [...this.activeTransfers.values()].every(
+            tr => tr.isFinalized || (!tr.file && tr.receivedCount >= tr.metadata.totalChunks)
+          );
+          if (allDone) {
+            this.callbacks.onAllFilesComplete?.();
+          }
+        }
+        
         continue;
       }
 
