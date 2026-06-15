@@ -8,9 +8,9 @@ Share files directly between browsers — no cloud storage, no file size limits 
 
 ```
 ┌─────────────┐        Signaling         ┌─────────────┐
-│   Sender    │◄──────(Socket.io)──────►│  Receiver   │
+│   Sender    │◄──────(Socket.io)──────► │  Receiver   │
 │  (Browser)  │                          │  (Browser)  │
-│             │◄═══════════════════════►│             │
+│             │◄═══════════════════════► │             │
 │             │    Direct P2P Transfer   │             │
 │             │      (WebRTC Data)       │             │
 └─────────────┘                          └─────────────┘
