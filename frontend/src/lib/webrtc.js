@@ -206,13 +206,30 @@ export class PeerConnection {
         out.set(json, 1);
         buf = out.buffer;
       }
-      if (!peer.relayMode && peer.dc?.readyState === 'open') peer.dc.send(buf);
+      if (!peer.relayMode && peer.dc?.readyState === 'open') {
+        // Respect backpressure: drop chunk if send buffer is overflowing (e.g. > 4MB)
+        if (peer.dc.bufferedAmount > 4 * 1024 * 1024) {
+          throw new Error('DataChannel send queue is full (Backpressure)');
+        }
+        peer.dc.send(buf);
+      }
       else this.socket.emit('relay-data', { roomId: this.roomId, data: buf, targetPeerId: peerId });
-    } catch (e) { console.warn(`[Swarm] _sendTo ${peerId}:`, e); }
+    } catch (e) {
+      if (!e.message.includes('Backpressure')) {
+        console.warn(`[Swarm] _sendTo ${peerId}:`, e.message);
+      }
+      throw e; // Bubble up so the caller knows the chunk failed and can retry
+    }
   }
 
   _broadcast(msg) {
-    for (const id of this.peers.keys()) this._sendTo(id, msg);
+    for (const id of this.peers.keys()) {
+      try {
+        this._sendTo(id, msg);
+      } catch (e) {
+        // Ignore broadcast failures, handled by pull loop retries
+      }
+    }
   }
 
   async _handleMsg(peerId, raw) {

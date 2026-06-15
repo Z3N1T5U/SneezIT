@@ -69,7 +69,6 @@ export class FileStorage {
       return zeroBitfield;
     }
   }
-
   /**
    * Determine which chunks are already written by checking file size.
    * A chunk at index i is "complete" if the file is large enough to contain it.
@@ -89,50 +88,54 @@ export class FileStorage {
    * Falls back to memory automatically on QuotaExceededError.
    */
   async writeChunk(offset, data) {
-    if (this.useOpfs && this.opfsWritable) {
-      try {
-        await this.opfsWritable.write({ type: 'write', position: offset, data });
-        return;
-      } catch (err) {
-        if (err.name === 'QuotaExceededError') {
-          console.warn('[Storage] OPFS quota exceeded! Falling back to memory for remaining chunks.');
-          // Close OPFS writable cleanly then switch to memory mode
-          try { await this.opfsWritable.close(); } catch (_) {}
-          this.opfsWritable = null;
-          this.useOpfs = false;
-          // Don't store this chunk in memory — it was already partially received.
-          // The chunk will be retried and land in memoryChunks.
+    return this._withLock(async () => {
+      if (this.useOpfs && this.opfsWritable) {
+        try {
+          await this.opfsWritable.write({ type: 'write', position: offset, data });
           return;
+        } catch (err) {
+          if (err.name === 'QuotaExceededError') {
+            console.warn('[Storage] OPFS quota exceeded! Falling back to memory for remaining chunks.');
+            // Close OPFS writable cleanly then switch to memory mode
+            try { await this.opfsWritable.close(); } catch (_) {}
+            this.opfsWritable = null;
+            this.useOpfs = false;
+            // Don't store this chunk in memory — it was already partially received.
+            // The chunk will be retried and land in memoryChunks.
+            return;
+          }
+          throw err; // Re-throw other errors
         }
-        throw err; // Re-throw other errors
       }
-    }
-    // Memory fallback — store by offset to allow out-of-order reassembly
-    this.memoryChunks.push({ offset, data: data instanceof ArrayBuffer ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) });
+      // Memory fallback — store by offset to allow out-of-order reassembly
+      this.memoryChunks.push({ offset, data: data instanceof ArrayBuffer ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) });
+    });
   }
 
   /**
    * Read a chunk range. Used by seeder peers to serve chunks to others.
    */
   async readChunk(offset, size) {
-    if (this.useOpfs && this.opfsFileHandle) {
-      try {
-        // Close and reopen writable so we can get a fresh File snapshot
-        if (this.opfsWritable) {
-          await this.opfsWritable.close();
-          this.opfsWritable = await this.opfsFileHandle.createWritable({ keepExistingData: true });
+    return this._withLock(async () => {
+      if (this.useOpfs && this.opfsFileHandle) {
+        try {
+          // Close and reopen writable so we can get a fresh File snapshot
+          if (this.opfsWritable) {
+            await this.opfsWritable.close();
+            this.opfsWritable = await this.opfsFileHandle.createWritable({ keepExistingData: true });
+          }
+          const file = await this.opfsFileHandle.getFile();
+          return await file.slice(offset, offset + size).arrayBuffer();
+        } catch (err) {
+          console.warn('[Storage] readChunk error:', err.message);
+          return new ArrayBuffer(0);
         }
-        const file = await this.opfsFileHandle.getFile();
-        return await file.slice(offset, offset + size).arrayBuffer();
-      } catch (err) {
-        console.warn('[Storage] readChunk error:', err.message);
-        return new ArrayBuffer(0);
       }
-    }
-    // Memory fallback
-    const chunk = this.memoryChunks.find(c => c.offset === offset);
-    if (chunk) return chunk.data instanceof ArrayBuffer ? chunk.data : chunk.data.buffer;
-    return new ArrayBuffer(0);
+      // Memory fallback
+      const chunk = this.memoryChunks.find(c => c.offset === offset);
+      if (chunk) return chunk.data instanceof ArrayBuffer ? chunk.data : chunk.data.buffer;
+      return new ArrayBuffer(0);
+    });
   }
 
   /**
