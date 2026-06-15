@@ -41,6 +41,8 @@ export function formatFileSize(bytes) {
  * Examples: 1048576 → "1.00 MB/s"
  */
 export function formatSpeed(bytesPerSecond) {
+  // Below 100 B/s is effectively idle — show as 0 B/s to avoid noise
+  if (bytesPerSecond < 100) return '0 B/s';
   return `${formatFileSize(bytesPerSecond)}/s`;
 }
 
