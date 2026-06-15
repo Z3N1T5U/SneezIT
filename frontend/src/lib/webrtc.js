@@ -556,7 +556,11 @@ export class PeerConnection {
       activePeers: this.peers.size,
     });
     try {
-      const blob = await t.storage.finish();
+      const rawBlob = await t.storage.finish();
+      
+      // Override the MIME type. OPFS strips it, which breaks file opening on mobile devices.
+      // Wrapping it in a new Blob with the correct type is a zero-copy operation.
+      const blob = new Blob([rawBlob], { type: t.metadata.type || 'application/octet-stream' });
       const url = URL.createObjectURL(blob);
       const isLarge = t.metadata.size > 200 * 1024 * 1024;
       let checksum = this.encryptionKey ? 'AES-GCM Authenticated' : 'Unencrypted Transfer';
