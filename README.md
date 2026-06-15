@@ -1,4 +1,4 @@
-# PeerDrop — P2P File Sharing
+# SneezIT — Files "achoo" across browsers
 
 A decentralized, browser-based peer-to-peer file sharing application built with **WebRTC** and **Socket.io**.
 
