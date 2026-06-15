@@ -556,8 +556,21 @@ export class PeerConnection {
       activePeers: this.peers.size,
     });
     try {
-      const rawBlob = await t.storage.finish();
+      let rawBlob = await t.storage.finish();
       
+      // Workaround for iOS/Android OPFS bugs: Mobile browsers often corrupt downloads 
+      // from OPFS-backed File objects via createObjectURL (saving files filled with zeroes).
+      // If on mobile and file is < 300MB, read it into memory first to guarantee successful download.
+      const isMobile = /Android|webOS|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.userAgent.includes("Mac") && "ontouchend" in document);
+      if (isMobile && rawBlob instanceof File && t.metadata.size < 300 * 1024 * 1024) {
+        try {
+          const buffer = await rawBlob.arrayBuffer();
+          rawBlob = new Blob([buffer]);
+        } catch (e) {
+          console.warn("[Swarm] Failed to load OPFS file into memory", e);
+        }
+      }
+
       // Override the MIME type. OPFS strips it, which breaks file opening on mobile devices.
       // Wrapping it in a new Blob with the correct type is a zero-copy operation.
       const blob = new Blob([rawBlob], { type: t.metadata.type || 'application/octet-stream' });
