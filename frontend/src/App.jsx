@@ -102,29 +102,53 @@ export default function App() {
   useEffect(() => { appStateRef.current = appState; }, [appState]);
 
   // --------------------------------------------------------------------------
-  // Parse URL for room code on load
+  // Parse URL for room code — AUTO-JOIN if link is pasted
   // --------------------------------------------------------------------------
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const urlRoom = params.get('room');
     const hashParams = new URLSearchParams(window.location.hash.slice(1));
     const urlKey = hashParams.get('key');
-    
-    if (urlRoom) {
-      const code = urlRoom.toUpperCase();
-      setJoinRoomInput(code);
-      setStatusMessage(`Room code "${code}" detected from link — enter it and click Join!`);
-      
+
+    if (!urlRoom) return;
+
+    const code = urlRoom.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!code || code.length < 4) return;
+
+    setJoinRoomInput(code); // Pre-fill input as visual feedback
+
+    // Auto-join: import key if present, then join directly
+    const autoJoin = async () => {
       if (urlKey) {
-        importKey(urlKey).then(key => {
-          encryptionKeyRef.current = key;
-        }).catch(err => {
-          console.error("Failed to import key:", err);
-          setErrorMessage("Invalid encryption key in URL.");
-        });
+        try {
+          encryptionKeyRef.current = await importKey(urlKey);
+        } catch (e) {
+          console.error('[AutoJoin] Failed to import key:', e);
+          // Continue anyway — transfer will be unencrypted
+        }
       }
-    }
-  }, []);
+
+      // Trigger join directly (bypasses joinRoomInput state read)
+      isSenderRef.current = false;
+      roomIdRef.current = code;
+      setIsSender(false);
+      setRoomId(code);
+      setErrorMessage('');
+      setAppState('joining');
+      setStatusMessage(`Joining room ${code}...`);
+
+      // setupSocket and getOrCreatePeerConnection are stable (useCallback with [] deps)
+      // so it is safe to call them from a mount-time effect.
+      setupSocket((socket) => {
+        console.log('[AutoJoin] Socket ready — emitting join-room:', code);
+        getOrCreatePeerConnection(socket, code, false);
+        socket.emit('join-room', { roomId: code });
+      });
+    };
+
+    autoJoin();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only run once on mount — setupSocket & getOrCreatePeerConnection are stable
 
   // --------------------------------------------------------------------------
   // Cleanup on unmount
@@ -336,18 +360,28 @@ export default function App() {
 
     // ---- Both peers: the other peer left ----
     socket.on('peer-disconnected', ({ peerId }) => {
-      console.log('[Socket] Peer disconnected:', peerId);
-      if (!allCompleteRef.current) {
+      // Defer by one tick so the swarm's own peer-disconnected handler runs FIRST
+      // and removes the peer from its map. Then getPeerCount() returns the
+      // correct post-disconnect count.
+      setTimeout(() => {
+        if (allCompleteRef.current) return;
+        const remainingPeers = peerConnectionRef.current?.getPeerCount() ?? 0;
         const state = appStateRef.current;
+
+        if (remainingPeers > 0) {
+          // Still connected to other peers — swarm's onPeerLeft already showed a toast.
+          // Don't change the app state at all.
+          return;
+        }
+
+        // All peers gone
         if (state === 'transferring') {
-          // Stay in transferring — the swarm's onPeerLeft callback handles
-          // showing the toast. Transfer can continue or wait for reconnect.
           setErrorMessage('Your peer has left. Transfer paused — they can rejoin to resume.');
-        } else if (state !== 'complete') {
+        } else if (state !== 'complete' && state !== 'waiting') {
           setErrorMessage('Your peer has left the room.');
           setAppState('waiting');
         }
-      }
+      }, 0); // setTimeout(0) defers to after current event queue is flushed
     });
 
     // ---- Socket reconnected — do NOT re-emit create-room/join-room ----
